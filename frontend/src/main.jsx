@@ -30,12 +30,11 @@ createRoot(document.getElementById('root')).render(
           metadata: {
             name: 'FRG Hold & Earn',
             description: 'Hold FRG in your own wallet, earn rewards on Luna Classic',
-            // TODO: update to the real deployed URL before launch.
-            url: 'https://lunc-projects.github.io/frg-hold-earn/',
+            url: 'https://frg-hold-earn-production.up.railway.app/',
             icons: [],
             redirect: {
-              native: 'https://lunc-projects.github.io/frg-hold-earn/',
-              universal: 'https://lunc-projects.github.io/frg-hold-earn/',
+              native: 'https://frg-hold-earn-production.up.railway.app/',
+              universal: 'https://frg-hold-earn-production.up.railway.app/',
             },
           },
         },
