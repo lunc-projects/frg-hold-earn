@@ -1,0 +1,1 @@
+{"dependencies":{"@cosmjs/cosmwasm-stargate":"^0.32.4","@cosmjs/proto-signing":"^0.32.4","@cosmjs/stargate":"^0.32.4","cors":"^2.8.5","express":"^4.19.2"},"name":"frg-hold-earn-server","private":true,"scripts":{"start":"node src/server.js","test":"node --test tests/*.test.js"},"type":"module","version":"0.1.0"}
