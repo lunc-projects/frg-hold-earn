@@ -33,15 +33,21 @@ export default function App() {
 
   const refresh = useCallback(async () => {
     if (!connected) return;
-    try {
-      const [h, r, rf, s] = await Promise.all([
-        fetchHoldings(address), getRewards(address), getReferrals(address), getStats(),
-      ]);
-      setHoldings(h); setRewards(r); setReferrals(rf); setStats(s);
-      setRefLink(`${window.location.origin}${window.location.pathname}?ref=${address}`);
-    } catch (e) {
-      pushLog(`Refresh failed: ${e.message}`);
-    }
+    // allSettled, not all: one stalled/failed lookup must never wipe the
+    // other three or leave the page stuck — each result lands on its own,
+    // and each failure logs visibly instead of hanging refresh.
+    const [h, r, rf, s] = await Promise.allSettled([
+      fetchHoldings(address), getRewards(address), getReferrals(address), getStats(),
+    ]);
+    if (h.status === 'fulfilled') setHoldings(h.value);
+    else pushLog(`Balance lookup failed: ${h.reason?.message || h.reason}`);
+    if (r.status === 'fulfilled') setRewards(r.value);
+    else pushLog(`Rewards lookup failed: ${r.reason?.message || r.reason}`);
+    if (rf.status === 'fulfilled') setReferrals(rf.value);
+    else pushLog(`Referrals lookup failed: ${rf.reason?.message || rf.reason}`);
+    if (s.status === 'fulfilled') setStats(s.value);
+    else pushLog(`Stats lookup failed: ${s.reason?.message || s.reason}`);
+    setRefLink(`${window.location.origin}${window.location.pathname}?ref=${address}`);
   }, [connected, address, pushLog]);
 
   // Auto-register on first connect when arriving via a referral link.
