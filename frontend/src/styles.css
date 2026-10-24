@@ -54,3 +54,8 @@ ol li { margin-bottom: 8px; line-height: 1.45; }
 .log pre { white-space: pre-wrap; word-break: break-word; font-size: 13px; color: #c7d2fe; margin: 0; }
 .adminstats { background: rgba(0, 0, 0, 0.3); border-radius: 10px; padding: 10px 12px; }
 .adminstats p { margin: 6px 0; }
+/* Battery visual: charge fill reflects the consolidated NFT calculation.
+   Pure CSS, no images — the fill width comes from the backend number. */
+.battery { position: relative; height: 34px; border: 3px solid rgba(255, 255, 255, 0.35); border-radius: 8px; padding: 3px; margin: 12px 0; }
+.battery::after { content: ''; position: absolute; right: -11px; top: 9px; width: 7px; height: 12px; background: rgba(255, 255, 255, 0.35); border-radius: 0 4px 4px 0; }
+.battery-fill { height: 100%; border-radius: 4px; background: linear-gradient(90deg, #f0c453, #34d399); transition: width 0.4s; }

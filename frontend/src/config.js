@@ -1,8 +1,11 @@
 // ─────────────────────────────────────────────────────────────
 // FRG Hold & Earn — frontend config.
-// NO contracts, NO staking, NO NFTs: holders keep FRG in their own
-// wallets; this app only READS balances and talks to the backend,
-// which pays rewards from the owner's payout wallet.
+// Core hold-and-earn: NO contracts, NO staking, NO locking — holders
+// keep FRG in their own wallets; this app only READS balances and talks
+// to the backend, which pays rewards from the owner's payout wallet.
+// Separate opt-in NFT bonus section: only active once the admin
+// configures a real CW721 collection address; until then the NFT
+// section honestly reports zero holdings and minting not open.
 // ─────────────────────────────────────────────────────────────
 
 export const CHAIN_ID = 'columbus-5';
