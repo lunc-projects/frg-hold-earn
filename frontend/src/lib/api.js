@@ -64,3 +64,33 @@ export const adminSetRate = (secret, address, percent) =>
   api('/api/admin/rate', { method: 'POST', headers: adminHeaders(secret, address), body: JSON.stringify({ percent }) });
 export const adminSnapshot = (secret, address) =>
   api('/api/admin/snapshot', { method: 'POST', headers: adminHeaders(secret, address) });
+
+// --- NFT bonus section ---
+// The backend never decides a mint: the mint below is a real
+// wallet-signed CW20 send from the connected wallet to the collection
+// contract. These helpers only read backend state and report txhashes.
+export const getNft = (address) => api(`/api/nft?address=${address}`);
+export const collectNftBonus = (address) =>
+  api('/api/nft/collect', { method: 'POST', body: JSON.stringify({ address }) });
+export const recordMint = (address, txhash) =>
+  api('/api/nft/mint-record', { method: 'POST', body: JSON.stringify({ address, txhash }) });
+export const getAdminNft = (secret, address) =>
+  api('/api/admin/nft', { headers: adminHeaders(secret, address) });
+export const adminSetNftSettings = (secret, address, settings) =>
+  api('/api/admin/nft/settings', { method: 'POST', headers: adminHeaders(secret, address), body: JSON.stringify(settings) });
+export const adminFundBonusPool = (secret, address, amountWhole, note) =>
+  api('/api/admin/nft/fund', { method: 'POST', headers: adminHeaders(secret, address), body: JSON.stringify({ amountWhole, note }) });
+
+// Read-only LCD smart queries against the NFT collection contract
+// (used to verify the contract matches the app settings BEFORE the
+// user signs any mint — never to decide amounts server-side).
+async function collectionQuery(collection, query) {
+  const res = await fetchWithTimeout(
+    `${LCD_URL}/cosmwasm/wasm/v1/contract/${collection}/smart/${b64(query)}`);
+  if (!res.ok) throw new Error(`Collection query failed (${res.status})`);
+  const data = await res.json();
+  return data.data;
+}
+export const fetchNftContractConfig = (collection) => collectionQuery(collection, { config: {} });
+export const fetchNftNumTokens = (collection) =>
+  collectionQuery(collection, { num_tokens: {} }).then((d) => d.count);
