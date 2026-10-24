@@ -1,9 +1,11 @@
 # 🌌 FRG Hold & Earn — Luna Classic
 
-Hold FRG in your own wallet, earn rewards. **No contracts, no NFTs, no
-staking, no cross-staking, no locking.** Holders keep their FRG in their
-own wallets at all times; they visit the website, connect, and Collect
-rewards. Earnings are measured by **daily balance snapshots** over time,
+Hold FRG in your own wallet, earn rewards. **Core hold-and-earn: no
+contracts, no staking, no cross-staking, no locking.** Holders keep
+their FRG in their own wallets at all times; they visit the website,
+connect, and Collect rewards. A separate opt-in NFT bonus section
+exists (see below) — it is inactive until the admin configures a
+real CW721 collection, and no collection is deployed yet. Earnings are measured by **daily balance snapshots** over time,
 so buying just before a payout and selling right after earns nothing
 for the days you were not holding.
 
@@ -183,3 +185,44 @@ deliberately NOT the LNC app's bright candy pastels. No remote JS
 module imports anywhere in the frontend (all libraries bundled
 locally — mobile wallet browsers fail on remote imports). Honest
 empty states only: no fake APY, no fake balance, no fake earnings.
+
+## NFT bonus section (built 2026-10-24, collection NOT deployed)
+
+A separate, opt-in section — base hold-and-earn rewards are untouched.
+Holders who also hold FRG NFTs earn extra bonus rewards on top:
+
+- **One calculation per wallet:** all of a holder's NFTs consolidate
+  into a single power value (the NFT count). That drives the battery
+  visual: charge % = count / threshold, showing FULLY POWERED at the
+  admin-set threshold count.
+- **Bonus formula:** flat FRG per NFT per snapshot day (admin-set in
+  the admin panel). Daily bonus = NFT count × bonus per NFT, accrued
+  during the same daily snapshot that records base rewards.
+- **Bonus pool:** a SEPARATE ledger from the daily pool, funded by
+  mint fees. Bonus Collect reuses the base Collect safety pattern
+  (pending counts as paid, failed send voids and stays collectable)
+  and never pays more than the tracked bonus pool balance. Sends go
+  out through the payout wallet (the only key on the server); the
+  bonus pool wallet setting designates where mint fees are collected.
+- **All numbers adjustable in the admin panel** (requireAdmin gate):
+  collection address, mint price, bonus per NFT per day, fully-powered
+  threshold, supply cap, bonus pool wallet. Invalid numbers are
+  rejected with a visible error.
+- **Honesty rules:** until a real collection address is configured,
+  bonus holdings read as zero and minting shows as not open — there
+  is no button that pretends to mint. Minting (once configured) is a
+  real wallet-signed CW20 send from the connected wallet to the
+  collection with a `{"mint":{}}` message; the app checks the
+  collection contract's config (price, fee recipient, sold-out state)
+  before signing, and the backend verifies the fee transfer on-chain
+  before crediting the tracked bonus pool.
+- **No other bonuses:** no PvP steal, no grid bonuses, no top-10
+  airdrops. Only this mechanic.
+- **Collection contract:** `contracts/frg-nft/` — a standard CW721
+  (source only, NOT deployed, NOT audited, NO migrate entry point).
+  Deployment needs the owner's wallet; see its README for the config
+  sync requirements (contract mint price / fee recipient must match
+  the app's admin panel settings exactly).
+- **Still undecided (owner's numbers):** mint price, bonus per NFT,
+  threshold count, supply cap. The app ships with all of them at 0 /
+  unset, which honestly means "not started yet."
