@@ -26,10 +26,12 @@ export const FRG = {
 // admin secret. Other apps keep their own admins.
 export const ADMIN_ADDRESS = 'terra1xketp9yp3lrvkkd6ypk2m7jkmtpxuh6yntdjmv';
 
-// Backend base URL. Build with VITE_API_URL='' for same-origin serving
-// (backend serves the built frontend), or the backend URL for split hosting.
-// Local dev default: the backend on :3001.
-export const API_BASE = import.meta.env.VITE_API_URL ?? 'http://localhost:3001';
+// Backend base URL. Default is same-origin ('') because the backend serves
+// the built frontend in production — a localhost fallback here breaks the
+// deployed app (the visitor's own phone has nothing on :3001, so every API
+// call fails to fetch). For local split dev only, build/run with
+// VITE_API_URL=http://localhost:3001.
+export const API_BASE = import.meta.env.VITE_API_URL ?? '';
 
 export const DECIMALS = 1_000_000;
 export const toWhole = (raw) => (Number(raw) / DECIMALS).toLocaleString();
