@@ -22,10 +22,15 @@ for the days you were not holding.
 1. A holder connects their wallet (first connect registers them; an
    optional `?ref=<wallet>` link records their referrer — first touch
    wins, the binding can never be changed later).
-2. Once a day, the backend snapshots every registered wallet's FRG
-   balance (live from the Terra Classic LCD).
-3. That day's configured reward pool splits **pro-rata** across that
-   day's snapshot balances. The split sums **exactly** to the pool
+2. The backend samples every registered wallet's FRG balance (live
+   from the Terra Classic LCD) **once an hour**. Once a day, the
+   snapshot fixes each wallet's weight as its **average sampled
+   balance for that day** — holding FRG for one hour earns ~1/24 of
+   the weight of holding it all day, so flash-holding into the
+   snapshot moment does not pay. A wallet with no samples that day
+   falls back to a single live read at snapshot time.
+3. That day's configured reward pool splits **pro-rata** across those
+   average balances. The split sums **exactly** to the pool
    (integer dust goes to the largest holder). Zero-balance holders
    earn zero. A wallet earns only for days it appears in a snapshot.
 4. The holder clicks **Collect**. The backend recomputes what they are
