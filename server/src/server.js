@@ -44,15 +44,30 @@ export function dayString(d = new Date()) {
 
 // Runs one day's snapshot + accrual. Idempotent: a second run for the
 // same day is a no-op (store.recordDay refuses a duplicate day).
+// Balance accuracy (2026-10-25): each wallet's split weight is its
+// AVERAGE sampled balance for the day (hourly samples, see
+// runBalanceSampling) — holding FRG for one hour earns ~1/24 of the
+// weight of holding it all day, so flash-holding into the snapshot
+// moment no longer pays. A wallet with no samples that day (e.g. the
+// sampler was down, or it registered after the last sample) falls
+// back to a live balance read, exactly the pre-upgrade behavior.
 // fetchNftCount (optional): when given, the same day also snapshots
 // each wallet's NFT count for the configured collection and accrues
 // NFT bonuses into the SEPARATE nft ledger. When omitted (old callers,
 // tests), the NFT side is skipped entirely — base behavior unchanged.
 export async function runSnapshot(store, fetchBalance, day = dayString(), fetchNftCount = null) {
   const wallets = store.allWallets();
+  const averages = store.averageBalances(day);
   const balances = [];
+  let averaged = 0;
   for (const w of wallets) {
-    balances.push({ wallet: w.address, balance: await fetchBalance(w.address) });
+    const a = averages.get(w.address);
+    if (a) {
+      balances.push({ wallet: w.address, balance: a.average });
+      averaged++;
+    } else {
+      balances.push({ wallet: w.address, balance: await fetchBalance(w.address) });
+    }
   }
   const pool = store.getDailyPool();
   const referralOf = new Map(wallets.map((w) => [w.address, w.referrer]));
@@ -71,7 +86,33 @@ export async function runSnapshot(store, fetchBalance, day = dayString(), fetchN
     }));
     nftOut = store.recordNftDay(day, nftCounts, nftBonuses);
   }
-  return { day, wallets: balances.length, totalBalance: total.toString(), pool: pool.toString(), ...result, nft: nftOut };
+  return {
+    day, wallets: balances.length, totalBalance: total.toString(), pool: pool.toString(),
+    ...result, nft: nftOut,
+    balanceSource: { averaged, live: balances.length - averaged },
+  };
+}
+
+// One sampling round: record every registered wallet's current FRG
+// balance under the current UTC day+hour. A wallet whose read fails
+// simply misses that hour (its average uses the hours that did land);
+// one failure never blocks the others. Also prunes samples older than
+// 7 days — a passed day can never be re-snapshotted, so they are
+// never read again.
+export async function runBalanceSampling(store, fetchBalance, now = new Date()) {
+  const day = dayString(now);
+  const hour = now.getUTCHours();
+  let sampled = 0;
+  let failed = 0;
+  for (const w of store.allWallets()) {
+    try {
+      store.recordBalanceSample(day, w.address, hour, await fetchBalance(w.address));
+      sampled++;
+    } catch { failed++; }
+  }
+  const cutoff = dayString(new Date(now.getTime() - 7 * 24 * 3600 * 1000));
+  store.pruneSamples(cutoff);
+  return { day, hour, sampled, failed };
 }
 
 // Tiny async mutex so two simultaneous collects can't double-pay.
@@ -109,6 +150,8 @@ export function createApp({ store, payout, config }) {
     totalAccrued: store.totalAccrued().toString(),
     totalPaid: store.totalPaid().toString(),
     snapshotDays: store.snapshotDays(),
+    // Count only (no balances): proves the hourly sampler is running.
+    balanceSamplesToday: store.sampleStats(dayString()).samples,
     dailyPool: store.getDailyPool().toString(),
     dailyPoolWhole: formatBaseToWhole(store.getDailyPool()),
     affiliateRatePercent: store.getAffiliateRateBps() / 100,
@@ -361,6 +404,7 @@ export function createApp({ store, payout, config }) {
       payoutCanSend: payout.configured,
       payoutAddress,
       payoutBalance,
+      balanceSamples: store.sampleStats(dayString()),
       nft: (() => {
         const s = store.getNftSettings();
         return {
@@ -494,6 +538,7 @@ export function configFromEnv(env = process.env) {
     port: Number(env.PORT || 3001),
     dbPath: env.DB_PATH || 'data/frg-hold-earn.db',
     snapshotIntervalMs: Number(env.SNAPSHOT_INTERVAL_MS || 24 * 60 * 60 * 1000),
+    sampleIntervalMs: Number(env.SAMPLE_INTERVAL_MS || 60 * 60 * 1000),
   };
 }
 
@@ -513,6 +558,15 @@ if (import.meta.url === `file://${process.argv[1]}`) {
       (r) => console.log('snapshot', r.day, r.skipped ? 'skipped (already done)' : `${r.wallets} wallets`),
       (e) => console.error('snapshot failed:', e.message));
   }, config.snapshotIntervalMs);
+  // Hourly balance sampling (accuracy upgrade): the day's snapshot
+  // splits on each wallet's average sampled balance. First round runs
+  // shortly after boot so a fresh deploy starts collecting samples
+  // right away instead of waiting for the first hour tick.
+  const sample = () => runBalanceSampling(store, fetchBalance).then(
+    (r) => console.log('balance sample', r.day, `hour ${r.hour}:`, `${r.sampled} ok, ${r.failed} failed`),
+    (e) => console.error('balance sampling failed:', e.message));
+  setTimeout(sample, 15000);
+  setInterval(sample, config.sampleIntervalMs);
   app.listen(config.port, async () => {
     // Address only — never anything about the key.
     console.log(`FRG Hold & Earn backend on :${config.port} (payout wallet: ${await payout.address() || 'not set'})`);

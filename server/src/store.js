@@ -30,6 +30,13 @@ export function openStore(path) {
       wallet TEXT, amount TEXT, status TEXT, txhash TEXT, created_at INTEGER);
     CREATE TABLE IF NOT EXISTS settings(
       key TEXT PRIMARY KEY, value TEXT);
+    -- Hourly balance samples (accuracy upgrade, 2026-10-25): one FRG
+    -- balance reading per registered wallet per UTC hour. A day's
+    -- snapshot splits the pool on each wallet's AVERAGE sampled
+    -- balance for the day, not a single moment's reading.
+    CREATE TABLE IF NOT EXISTS balance_samples(
+      day TEXT, wallet TEXT, hour INTEGER, balance TEXT,
+      PRIMARY KEY(day, wallet, hour));
     -- NFT bonus section (separate from base rewards by design):
     -- nft_days/nft_snapshots/nft_accruals mirror the base snapshot
     -- ledger but NEVER mix into it — base Collect must never pay NFT
@@ -138,6 +145,41 @@ export function openStore(path) {
     },
     snapshotDays() {
       return all(`SELECT day FROM day_pools ORDER BY day`).map((r) => r.day);
+    },
+
+    // --- Hourly balance samples (accuracy upgrade, 2026-10-25) ---
+    // One sample per wallet per UTC hour; re-sampling the same hour
+    // replaces that hour's reading (latest wins). Averages are exact
+    // BigInt math: SUM of base-unit samples / sample count (integer
+    // division drops < 1 base unit — far below display precision, and
+    // the split's dust rule still makes shares sum exactly to the pool).
+    recordBalanceSample(day, wallet, hour, balance) {
+      run(`INSERT INTO balance_samples(day, wallet, hour, balance) VALUES(?, ?, ?, ?)
+           ON CONFLICT(day, wallet, hour) DO UPDATE SET balance = excluded.balance`,
+          day, wallet, hour, String(balance));
+    },
+    // Map wallet -> { average: BigInt, samples: n } for one day.
+    // Wallets with no samples that day are absent — callers fall back
+    // to a live balance read for them.
+    averageBalances(day) {
+      const rows = all(`SELECT wallet, SUM(CAST(balance AS INTEGER)) AS s, COUNT(*) AS n
+                        FROM balance_samples WHERE day = ? GROUP BY wallet`, day);
+      const out = new Map();
+      for (const r of rows) {
+        out.set(r.wallet, { average: BigInt(r.s) / BigInt(r.n), samples: r.n });
+      }
+      return out;
+    },
+    sampleStats(day) {
+      const r = q(`SELECT COUNT(*) AS rows_n, COUNT(DISTINCT wallet) AS holders_n
+                   FROM balance_samples WHERE day = ?`, day);
+      return { samples: r.rows_n, holders: r.holders_n };
+    },
+    // Samples older than the cutoff day are dead weight: a day that
+    // has passed can never be re-snapshotted (recordDay refuses
+    // duplicates), so its samples are never read again.
+    pruneSamples(beforeDay) {
+      run(`DELETE FROM balance_samples WHERE day < ?`, beforeDay);
     },
 
     // --- Ledgers ---
