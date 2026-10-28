@@ -1,7 +1,12 @@
 // ─────────────────────────────────────────────────────────────
 // FRG Hold & Earn — storage module (SQLite, via node:sqlite).
-// All money values are TEXT holding integer base units (uFRG, 6 dp)
-// so no float rounding ever touches a balance.
+// All money values are TEXT holding integer 6-decimal base units, so
+// no float rounding ever touches a balance. Currency is table-scoped:
+// - snapshots / balance_samples hold FRG balances (the held asset);
+// - day_pools / accruals / payments hold USTC base units (denom
+//   "uusd") for the base reward engine;
+// - nft_* ledgers remain FRG, as that separate bonus mechanic was not
+//   converted. See the one-time legacy migration below.
 // One store = one SQLite file. Production MUST NOT use a local file:
 // Railway's filesystem is ephemeral and a claims ledger wiped on
 // redeploy would double-pay. See README "Production storage TODO"
@@ -55,6 +60,20 @@ export function openStore(path) {
     CREATE TABLE IF NOT EXISTS nft_pool_events(
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       amount TEXT, note TEXT, txhash TEXT UNIQUE, created_at INTEGER);
+    -- One-time USTC conversion audit tables. The archive preserves a
+    -- verbatim copy of every pre-conversion base accrual row before
+    -- the active accrual ledger is cleared; the migration table is
+    -- both the run record and the flag that prevents a second run.
+    CREATE TABLE IF NOT EXISTS legacy_frg_accruals(
+      legacy_id INTEGER PRIMARY KEY AUTOINCREMENT,
+      original_id INTEGER, day TEXT, wallet TEXT, kind TEXT, amount TEXT,
+      archived_at INTEGER, migration_id INTEGER);
+    CREATE TABLE IF NOT EXISTS reward_currency_migrations(
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      from_symbol TEXT, to_symbol TEXT, to_denom TEXT,
+      archived_rows INTEGER, archived_amount TEXT,
+      archived_unpaid_amount TEXT, legacy_daily_pool TEXT,
+      migrated_at INTEGER);
   `);
   // Defaults (only when never set): daily pool 0, affiliate rate 10%.
   db.prepare(`INSERT OR IGNORE INTO settings(key, value)
@@ -72,6 +91,85 @@ export function openStore(path) {
   const q = (sql, ...args) => db.prepare(sql).get(...args);
   const all = (sql, ...args) => db.prepare(sql).all(...args);
   const run = (sql, ...args) => db.prepare(sql).run(...args);
+
+  // ── One-time FRG -> USTC base-reward migration ──────────────────
+  // Runs on the first openStore() under the USTC code. Exact rule:
+  // 1. EVERY row then present in the base `accruals` table (kinds
+  //    'share' and 'bonus') is copied verbatim to
+  //    `legacy_frg_accruals`, tagged with this migration's id.
+  // 2. The copied rows are then removed from active `accruals`, so
+  //    their FRG-denominated value can never be claimed as USTC.
+  //    Historical `payments` rows are not rewritten; unpaid legacy
+  //    earnings are computed as accrued - (pending + confirmed paid)
+  //    per wallet, floored at zero, and recorded in the migration row.
+  // 3. The legacy numeric daily-pool setting is recorded and reset
+  //    to 0: an old "100 FRG/day" value must never be silently
+  //    reinterpreted as "100 USTC/day". The owner sets a new USTC/day
+  //    pool deliberately after the conversion.
+  // 4. NFT tables are deliberately untouched (separate FRG mechanic).
+  // The reward_currency_migrations row is the guard: if one exists,
+  // this function is a no-op, including on later restarts and after
+  // new USTC accruals have been recorded.
+  function runLegacyFrgRewardMigration() {
+    const existing = q(`SELECT * FROM reward_currency_migrations ORDER BY id ASC LIMIT 1`);
+    if (existing) return existing;
+
+    const accrualRows = all(`SELECT * FROM accruals ORDER BY id`);
+    const accruedByWallet = new Map();
+    let archivedAmount = 0n;
+    for (const row of accrualRows) {
+      const amount = BigInt(row.amount);
+      archivedAmount += amount;
+      accruedByWallet.set(row.wallet, (accruedByWallet.get(row.wallet) || 0n) + amount);
+    }
+    const paidByWallet = new Map();
+    for (const row of all(
+      `SELECT wallet, amount FROM payments WHERE status IN ('pending', 'confirmed')`)) {
+      paidByWallet.set(row.wallet, (paidByWallet.get(row.wallet) || 0n) + BigInt(row.amount));
+    }
+    let archivedUnpaidAmount = 0n;
+    for (const [wallet, accrued] of accruedByWallet) {
+      const unpaid = accrued - (paidByWallet.get(wallet) || 0n);
+      if (unpaid > 0n) archivedUnpaidAmount += unpaid;
+    }
+    const poolRow = q(`SELECT value FROM settings WHERE key = 'daily_pool'`);
+    const legacyDailyPool = BigInt(poolRow?.value ?? '0');
+    const migratedAt = Date.now();
+
+    try {
+      db.exec('BEGIN');
+      const inserted = run(
+        `INSERT INTO reward_currency_migrations(
+           from_symbol, to_symbol, to_denom, archived_rows, archived_amount,
+           archived_unpaid_amount, legacy_daily_pool, migrated_at)
+         VALUES('FRG', 'USTC', 'uusd', ?, ?, ?, ?, ?)`,
+        accrualRows.length, String(archivedAmount), String(archivedUnpaidAmount),
+        String(legacyDailyPool), migratedAt);
+      const migrationId = Number(inserted.lastInsertRowid);
+      for (const row of accrualRows) {
+        run(
+          `INSERT INTO legacy_frg_accruals(
+             original_id, day, wallet, kind, amount, archived_at, migration_id)
+           VALUES(?, ?, ?, ?, ?, ?, ?)`,
+          row.id, row.day, row.wallet, row.kind, row.amount, migratedAt, migrationId);
+      }
+      run(`DELETE FROM accruals`);
+      run(`INSERT INTO settings(key, value) VALUES('daily_pool', '0')
+           ON CONFLICT(key) DO UPDATE SET value = excluded.value`);
+      run(`INSERT INTO settings(key, value) VALUES('reward_denom', 'uusd')
+           ON CONFLICT(key) DO UPDATE SET value = excluded.value`);
+      run(`INSERT INTO settings(key, value) VALUES('reward_symbol', 'USTC')
+           ON CONFLICT(key) DO UPDATE SET value = excluded.value`);
+      db.exec('COMMIT');
+      return q(`SELECT * FROM reward_currency_migrations WHERE id = ?`, migrationId);
+    } catch (e) {
+      try { db.exec('ROLLBACK'); } catch { /* already rolled back */ }
+      throw e;
+    }
+  }
+  runLegacyFrgRewardMigration();
+  db.prepare(`INSERT OR IGNORE INTO settings(key, value)
+              VALUES('reward_denom', 'uusd'), ('reward_symbol', 'USTC')`).run();
 
   return {
     db,
@@ -108,11 +206,35 @@ export function openStore(path) {
       run(`INSERT INTO settings(key, value) VALUES('affiliate_rate_bps', ?)
            ON CONFLICT(key) DO UPDATE SET value = excluded.value`, String(bps));
     },
+    // Conversion audit: the first (and only) FRG -> USTC migration
+    // record, or null if this store somehow predates the migration
+    // code without having run it. Amounts are BigInt base units:
+    // archived amounts are legacy FRG; see runLegacyFrgRewardMigration
+    // above for the exact rule.
+    getRewardCurrencyMigration() {
+      const r = q(`SELECT * FROM reward_currency_migrations ORDER BY id ASC LIMIT 1`);
+      if (!r) return null;
+      return {
+        id: r.id,
+        fromSymbol: r.from_symbol,
+        toSymbol: r.to_symbol,
+        toDenom: r.to_denom,
+        archivedRows: r.archived_rows,
+        archivedAmount: BigInt(r.archived_amount),
+        archivedUnpaidAmount: BigInt(r.archived_unpaid_amount),
+        legacyDailyPool: BigInt(r.legacy_daily_pool),
+        migratedAt: r.migrated_at,
+      };
+    },
+    legacyAccruals() {
+      return all(`SELECT * FROM legacy_frg_accruals ORDER BY legacy_id`);
+    },
 
     // --- Daily snapshot + accrual (idempotent per day) ---
     // Returns { skipped: true } if this day already accrued — a second
-    // run for the same day must NEVER double-accrue.
-    // `shares`/`bonuses` are [{wallet, amount: BigInt}] computed by engine.js.
+    // run for the same day must NEVER double-accrue. Snapshot balances
+    // are FRG weights; pool/shares/bonuses are USTC base units computed
+    // by engine.js.
     recordDay(day, poolBaseUnits, snapshotBalances, shares, bonuses) {
       if (q(`SELECT day FROM day_pools WHERE day = ?`, day)) return { skipped: true };
       // node:sqlite has no transaction() helper — explicit BEGIN/COMMIT.
@@ -182,7 +304,7 @@ export function openStore(path) {
       run(`DELETE FROM balance_samples WHERE day < ?`, beforeDay);
     },
 
-    // --- Ledgers ---
+    // --- Ledgers (active base ledger: USTC base units) ---
     accrued(wallet) {
       const r = q(`SELECT COALESCE(SUM(CAST(amount AS INTEGER)), 0) AS t
                    FROM accruals WHERE wallet = ?`, wallet);
