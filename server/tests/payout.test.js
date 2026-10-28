@@ -20,7 +20,21 @@ test('key-only config: address derives from the key, no network needed', async (
   const p = createPayout({ lcdUrl: 'http://127.0.0.1:1', rpcUrl: '', payoutAddress: '', mnemonic: TEST_MNEMONIC });
   const addr = await p.address();
   assert.match(addr, /^terra1[0-9a-z]{38}$/);
+  // Terra derivation path (coin type 330): the public test mnemonic
+  // must derive its known Terra-wallet address. Regression guard for
+  // the 2026-10-27 bug, where the CosmJS default Cosmos path (118)
+  // derived a different address and every Collect was refused.
+  assert.equal(addr, 'terra1amdttz2937a3dytmxmkany53pp6ma6dy4vsllv');
   assert.equal(p.configured, true);
+});
+
+test('key matching the payout address (Terra 330) passes the mismatch guard', async () => {
+  const TERRA_ADDR = 'terra1amdttz2937a3dytmxmkany53pp6ma6dy4vsllv';
+  const p = createPayout({ lcdUrl: 'http://127.0.0.1:1', rpcUrl: '', payoutAddress: TERRA_ADDR, mnemonic: TEST_MNEMONIC });
+  // Sends proceed past the key/address check and fail later on the
+  // (unreachable) LCD read — crucially NOT with the mismatch error.
+  await assert.rejects(() => p.sendUstc(TERRA_ADDR, 1n), (e) => !/misconfigured/.test(e.message));
+  await assert.rejects(() => p.send(TERRA_ADDR, 1n), (e) => !/misconfigured/.test(e.message));
 });
 
 test('address/key mismatch refuses before any send', async () => {
