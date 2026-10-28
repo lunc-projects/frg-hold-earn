@@ -86,7 +86,7 @@ export default function App() {
     setCollecting(true);
     try {
       const out = await collect(address);
-      pushLog(`✅ Collected ${out.paidWhole} FRG — ${FINDER}/tx/${out.txhash}`);
+      pushLog(`✅ Collected ${out.paidWhole} USTC — ${FINDER}/tx/${out.txhash}`);
       await refresh();
     } catch (e) {
       pushLog(`Collect failed: ${e.message}`);
@@ -200,7 +200,7 @@ export default function App() {
       <div className="hero">
         <div className="planet">🌌</div>
         <h1>FRG Hold &amp; Earn</h1>
-        <p className="tagline">Hold FRG in your own wallet. Earn rewards. Nothing ever leaves your wallet.</p>
+        <p className="tagline">Hold FRG in your own wallet. Earn USTC. Nothing ever leaves your wallet.</p>
       </div>
 
       <div className="card">
@@ -228,16 +228,16 @@ export default function App() {
 
       <div className="card">
         <h2>🎁 Your rewards</h2>
-        <p>Accrued: <span className="big">{connected && rewards ? toWhole(rewards.accrued) : '—'}</span> FRG</p>
-        <p>Already collected: <span>{connected && rewards ? toWhole(rewards.paid) : '—'}</span> FRG</p>
-        <p>Ready to collect: <span className="big gold">{connected && rewards ? toWhole(rewards.claimable) : '—'}</span> FRG</p>
+        <p>Accrued: <span className="big">{connected && rewards ? toWhole(rewards.accrued) : '—'}</span> USTC</p>
+        <p>Already collected: <span>{connected && rewards ? toWhole(rewards.paid) : '—'}</span> USTC</p>
+        <p>Ready to collect: <span className="big gold">{connected && rewards ? toWhole(rewards.claimable) : '—'}</span> USTC</p>
         {connected && rewards && Number(rewards.claimable) === 0 && (
           <p className="muted">No rewards accrued yet — they build up from daily snapshots of your holdings. Come back after a snapshot day.</p>
         )}
         <button className="glow" disabled={!connected || collecting} onClick={doCollect}>
           {collecting ? 'Collecting…' : '✨ Collect rewards'}
         </button>
-        <p className="muted">Collect sends FRG from the program&apos;s payout wallet straight to your wallet. No amount is ever promised — what you see is what the snapshots earned.</p>
+        <p className="muted">Collect sends USTC from the program&apos;s payout wallet straight to your wallet. No amount is ever promised — what you see is what the snapshots earned.</p>
       </div>
 
       <div className="card">
@@ -292,7 +292,7 @@ export default function App() {
               else pushLog(`Copy this link: ${refLink}`);
             }}>Copy link</button>
             <p>Referrals: <span className="big">{referrals ? referrals.count : '…'}</span>
-              {referrals && <span className="muted"> · bonus earned from referrals: {toWhole(referrals.bonusEarned)} FRG</span>}</p>
+              {referrals && <span className="muted"> · bonus earned from referrals: {toWhole(referrals.bonusEarned)} USTC</span>}</p>
             <p className="muted">Friends who connect through your link are linked to you. A referral bonus is planned — it would be paid from the reward pot, never taken from their share. Affiliate details are still to be confirmed: the rate shown ({stats ? `${stats.affiliateRatePercent}%` : '…'}) is a proposed default, not final.</p>
           </>
         ) : (
@@ -305,12 +305,12 @@ export default function App() {
         <ol>
           <li>Hold FRG in your own wallet — it never moves.</li>
           <li>Each day, the program snapshots every registered wallet&apos;s FRG balance.</li>
-          <li>That day&apos;s reward pool splits pro-rata across the snapshot balances.</li>
-          <li>Come here any time and Collect — rewards arrive from the payout wallet.</li>
+          <li>That day&apos;s USTC reward pool splits pro-rata across the FRG snapshot balances.</li>
+          <li>Come here any time and Collect — USTC rewards arrive from the payout wallet.</li>
           <li>Share your referral link: a referral bonus is planned (details to be confirmed) — it would come from the same pot, never from your referrals&apos; share.</li>
         </ol>
         {stats && (
-          <p className="muted">Program totals: {stats.holders} holders · {toWhole(stats.totalPaid)} FRG paid out · daily pool {toWhole(stats.dailyPool)} FRG · {stats.snapshotDays.length} snapshot days so far.</p>
+          <p className="muted">Program totals: {stats.holders} holders · {toWhole(stats.totalPaid)} USTC paid out · daily pool {toWhole(stats.dailyPool)} USTC · {stats.snapshotDays.length} snapshot days so far.</p>
         )}
         <button className="ghost" onClick={refresh}>🔄 Refresh</button>
       </div>
@@ -323,11 +323,15 @@ export default function App() {
           <button className="cyan" onClick={loadAdmin}>Load admin stats</button>
           {adminStats && (
             <div className="adminstats">
-              <p>Holders: {adminStats.holders} · Paid out: {toWhole(adminStats.totalPaid)} FRG · Accrued: {toWhole(adminStats.totalAccrued)} FRG</p>
-              <p>Daily pool: {toWhole(adminStats.dailyPool)} FRG · Affiliate rate: {adminStats.affiliateRatePercent}%</p>
+              <p>Holders: {adminStats.holders} · Paid out: {toWhole(adminStats.totalPaid)} USTC · Accrued: {toWhole(adminStats.totalAccrued)} USTC</p>
+              <p>Daily pool: {toWhole(adminStats.dailyPool)} USTC · Affiliate rate: {adminStats.affiliateRatePercent}%</p>
               <p>Payout wallet: {adminStats.payoutAddress ? <span className="mono">{adminStats.payoutAddress}</span> : 'not set yet'}
-                {adminStats.payoutBalance !== null && <> · balance: {toWhole(adminStats.payoutBalance)} FRG</>}
+                {adminStats.payoutUstcBalance !== null && adminStats.payoutUstcBalance !== undefined && <> · USTC balance: {toWhole(adminStats.payoutUstcBalance)} USTC</>}
+                {adminStats.payoutBalance !== null && <> · FRG balance: {toWhole(adminStats.payoutBalance)} FRG</>}
                 {!adminStats.payoutCanSend && <span className="warn"> · auto-payout key not configured — collects will report &quot;not configured&quot; until the key is set in Railway</span>}</p>
+              {adminStats.rewardMigration && adminStats.rewardMigration.archivedRows > 0 && (
+                <p>Legacy conversion: {adminStats.rewardMigration.archivedRows} FRG-denominated accrual rows archived on {new Date(adminStats.rewardMigration.migratedAt).toLocaleDateString()} ({adminStats.rewardMigration.archivedAmountWhole} FRG gross, {adminStats.rewardMigration.archivedUnpaidAmountWhole} FRG unpaid) — archived only, not payable as USTC. The legacy daily pool was reset to 0.</p>
+              )}
               <p>Snapshot days: {adminStats.snapshotDays.length ? adminStats.snapshotDays.join(', ') : 'none yet'}</p>
               {adminStats.nft && (
                 <p>NFT: collection {adminStats.nft.collection || 'not configured'}
@@ -339,7 +343,7 @@ export default function App() {
               )}
             </div>
           )}
-          <label className="muted" htmlFor="pool-input">Daily reward pool (FRG)</label>
+          <label className="muted" htmlFor="pool-input">Daily reward pool (USTC)</label>
           <input id="pool-input" type="number" min="0" step="any" placeholder="e.g. 1000" value={poolInput} onChange={(e) => setPoolInput(e.target.value)} />
           <button className="cyan" onClick={() => poolInput && doAdmin('Daily pool set', () => adminSetPool(adminSecret, address, poolInput))}>Set daily pool</button>
           <label className="muted" htmlFor="rate-input">Affiliate rate (%) — proposed default, pending confirmation</label>
