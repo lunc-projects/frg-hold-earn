@@ -28,8 +28,18 @@
 //   never travel through chat.
 // ─────────────────────────────────────────────────────────────
 import { DirectSecp256k1HdWallet } from '@cosmjs/proto-signing';
+import { stringToPath } from '@cosmjs/crypto';
 import { SigningCosmWasmClient } from '@cosmjs/cosmwasm-stargate';
 import { SigningStargateClient, GasPrice } from '@cosmjs/stargate';
+
+// Terra HD derivation path (coin type 330). Terra wallets (Terra
+// Station, Keplr, Leap, Galaxy Station) derive Terra addresses with
+// m/44'/330'/0'/0/0. CosmJS's DEFAULT path is the Cosmos one
+// (m/44'/118'/0'/0/0), which derives a DIFFERENT terra1 address from
+// the same mnemonic — that bug made the key/address guard refuse
+// every Collect on 2026-10-27 even though the owner's key was the
+// correct payout-wallet key. Every derivation below uses 330.
+const TERRA_HD_PATHS = [stringToPath("m/44'/330'/0'/0/0")];
 
 export const FRG_TOKEN = 'terra14rfnhc2aru7jp304lht3yf903necsnrt4cxd464cftsfcksw0rtsgundnt';
 export const USTC_DENOM = 'uusd';
@@ -66,7 +76,7 @@ export function createPayout({ lcdUrl, rpcUrl, payoutAddress, mnemonic }) {
     if (envAddress) return envAddress;
     if (!hasKey) return null;
     if (!derivedAddress) {
-      const wallet = await DirectSecp256k1HdWallet.fromMnemonic(mnemonic.trim(), { prefix: 'terra' });
+      const wallet = await DirectSecp256k1HdWallet.fromMnemonic(mnemonic.trim(), { prefix: 'terra', hdPaths: TERRA_HD_PATHS });
       derivedAddress = (await wallet.getAccounts())[0].address;
     }
     return derivedAddress;
@@ -78,7 +88,7 @@ export function createPayout({ lcdUrl, rpcUrl, payoutAddress, mnemonic }) {
   // address itself, so comparing against it could never fail).
   async function sendingWallet() {
     if (!hasKey) throw new Error('payout wallet not configured yet');
-    const wallet = await DirectSecp256k1HdWallet.fromMnemonic(mnemonic.trim(), { prefix: 'terra' });
+    const wallet = await DirectSecp256k1HdWallet.fromMnemonic(mnemonic.trim(), { prefix: 'terra', hdPaths: TERRA_HD_PATHS });
     const from = (await wallet.getAccounts())[0].address;
     if (envAddress && from !== envAddress) {
       throw new Error('payout wallet misconfigured: key does not match payout address');
