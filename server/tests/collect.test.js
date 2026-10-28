@@ -14,16 +14,26 @@ const C = 'terra1' + 'p'.repeat(38); // late registrant
 const ADMIN = 'terra1' + 'w'.repeat(38);
 const SECRET = 'test-secret';
 
-function fakePayout({ balance = 10_000_000n, configured = true } = {}) {
+function fakePayout({ balance = 10_000_000n, ustcBalance = balance, configured = true } = {}) {
   const sent = [];
+  const sentUstc = [];
   return {
     sent,
+    sentUstc,
     configured,
     canSend: configured,
     address: async () => 'terra1' + 'z'.repeat(38),
+    // FRG CW20 path (NFT bonus only — base Collect must never use it).
     getBalance: async () => balance,
     send: async (to, amount) => {
       sent.push({ to, amount });
+      return 'FAKETX123';
+    },
+    // USTC native path (base rewards).
+    getUstcBalance: async () => ustcBalance,
+    getRewardBalance: async () => ustcBalance,
+    sendUstc: async (to, amount) => {
+      sentUstc.push({ to, amount });
       return 'FAKETX123';
     },
   };
@@ -51,8 +61,9 @@ const post = (base, p, body, headers = {}) => fetch(`${base}${p}`, {
 const get = (base, p, headers = {}) => fetch(`${base}${p}`, { headers })
   .then(async (r) => ({ status: r.status, body: await r.json() }));
 
-// Seed: A holds 1,000,000 (base) on day 1, referred by B. Pool 1,000,000.
-// A earns the whole pool; B earns the 10% bonus (100,000).
+// Seed: A holds 1,000,000 FRG base units on day 1, referred by B.
+// Pool is 1,000,000 USTC base units (1 USTC, denom uusd), split by FRG
+// weight. A earns the whole pool; B earns the 10% bonus (100,000 uusd).
 async function seeded() {
   const payout = fakePayout();
   const ctx = await startApp({ payout });
@@ -63,21 +74,25 @@ async function seeded() {
   return { ...ctx, payout };
 }
 
-test('collect pays the server-computed amount, and only once', async (t) => {
+test('collect pays the server-computed USTC amount, and only once', async (t) => {
   const { server, base, payout } = await seeded();
   t.after(() => { server.closeAllConnections(); server.close(); });
   const r1 = await get(base, `/api/rewards?address=${A}`);
   assert.equal(r1.body.claimable, '1000000');
+  assert.equal(r1.body.rewardDenom, 'uusd');
+  assert.equal(r1.body.rewardSymbol, 'USTC');
   const c1 = await post(base, '/api/collect', { address: A });
   assert.equal(c1.status, 200);
   assert.equal(c1.body.paid, '1000000');
+  assert.equal(c1.body.rewardDenom, 'uusd');
   assert.equal(c1.body.txhash, 'FAKETX123');
-  assert.equal(payout.sent.length, 1);
-  assert.equal(payout.sent[0].amount, 1000000n);
+  assert.equal(payout.sentUstc.length, 1);
+  assert.equal(payout.sentUstc[0].amount, 1000000n);
+  assert.equal(payout.sent.length, 0); // FRG CW20 path untouched by base Collect
   const c2 = await post(base, '/api/collect', { address: A });
   assert.equal(c2.status, 400);
   assert.match(c2.body.error, /nothing to collect/);
-  assert.equal(payout.sent.length, 1); // double-collect pays once
+  assert.equal(payout.sentUstc.length, 1); // double-collect pays once
 });
 
 test('frontend-supplied amounts are ignored', async (t) => {
@@ -85,11 +100,13 @@ test('frontend-supplied amounts are ignored', async (t) => {
   t.after(() => { server.closeAllConnections(); server.close(); });
   const c = await post(base, '/api/collect', { address: A, amount: '999999999' });
   assert.equal(c.status, 200);
-  assert.equal(payout.sent[0].amount, 1000000n); // server's number, not the client's
+  assert.equal(payout.sentUstc[0].amount, 1000000n); // server's number, not the client's
+  assert.equal(payout.sent.length, 0);
 });
 
-test('insufficient payout balance fails safely, nothing marked paid', async (t) => {
-  const payout = fakePayout({ balance: 10n });
+test('insufficient USTC payout balance fails safely, nothing marked paid', async (t) => {
+  // Plenty of FRG, almost no USTC: the USTC cap is the one that binds.
+  const payout = fakePayout({ balance: 10_000_000n, ustcBalance: 10n });
   const ctx = await startApp({ payout });
   t.after(() => { ctx.server.closeAllConnections(); ctx.server.close(); });
   ctx.store.registerWallet(A, B);
@@ -98,6 +115,7 @@ test('insufficient payout balance fails safely, nothing marked paid', async (t) 
   const c = await post(ctx.base, '/api/collect', { address: A });
   assert.equal(c.status, 400);
   assert.match(c.body.error, /rewards pool empty, top up/);
+  assert.equal(payout.sentUstc.length, 0);
   assert.equal(payout.sent.length, 0);
   const r = await get(ctx.base, `/api/rewards?address=${A}`);
   assert.equal(r.body.claimable, '1000000'); // unchanged, still collectable later
@@ -147,10 +165,16 @@ test('admin gating: wrong wallet/secret refused, correct pair works', async (t) 
   assert.equal(wrongWallet.status, 403);
   const ok = await get(base, '/api/admin', { 'x-admin-wallet': ADMIN, 'x-admin-secret': SECRET });
   assert.equal(ok.status, 200);
+  assert.equal(ok.body.rewardDenom, 'uusd');
+  assert.equal(ok.body.rewardSymbol, 'USTC');
+  assert.equal(ok.body.payoutBalance, '10000000'); // FRG CW20 balance still shown
+  assert.equal(ok.body.payoutUstcBalance, '10000000'); // live USTC balance alongside it
+  assert.equal(ok.body.rewardMigration.archivedAmount, '0'); // fresh store: migration ran, nothing legacy
   const setPool = await post(base, '/api/admin/pool', { poolWhole: '5000' },
     { 'x-admin-wallet': ADMIN, 'x-admin-secret': SECRET });
   assert.equal(setPool.status, 200);
-  assert.equal(setPool.body.dailyPool, '5000000000');
+  assert.equal(setPool.body.dailyPool, '5000000000'); // 5,000 USTC in uusd base units
+  assert.equal(setPool.body.rewardDenom, 'uusd');
   const setPoolBad = await post(base, '/api/admin/pool', { poolWhole: '5000' },
     { 'x-admin-wallet': ADMIN, 'x-admin-secret': 'nope' });
   assert.equal(setPoolBad.status, 403);
@@ -165,6 +189,19 @@ test('admin endpoints refuse outright when no secret is configured', async (t) =
   t.after(() => { server.closeAllConnections(); server.close(); });
   const r = await get(base, '/api/admin', { 'x-admin-wallet': ADMIN, 'x-admin-secret': 'anything' });
   assert.equal(r.status, 503);
+});
+
+test('public stats denominate the daily pool and totals in USTC', async (t) => {
+  const { server, base, store } = await startApp();
+  t.after(() => { server.closeAllConnections(); server.close(); });
+  store.setDailyPool(2_500_000n); // 2.5 USTC/day
+  const s = await get(base, '/api/stats');
+  assert.equal(s.status, 200);
+  assert.equal(s.body.dailyPool, '2500000');
+  assert.equal(s.body.dailyPoolWhole, '2.5');
+  assert.equal(s.body.rewardDenom, 'uusd');
+  assert.equal(s.body.rewardSymbol, 'USTC');
+  assert.equal(s.body.heldTokenSymbol, 'FRG');
 });
 
 test('referral bonus accrues to the referrer, collectable by them', async (t) => {

@@ -4,11 +4,30 @@ import assert from 'node:assert/strict';
 import {
   computeShares, computeBonuses, computeDay,
   parseWholeToBase, formatBaseToWhole, isValidTerraAddress,
+  REWARD_DENOM, REWARD_SYMBOL, HELD_TOKEN_SYMBOL,
 } from '../src/engine.js';
 
 const A = 'terra1' + 'a'.repeat(38);
 const B = 'terra1' + 'q'.repeat(38);
 const C = 'terra1' + 'p'.repeat(38);
+
+test('currency constants: FRG is held, USTC (uusd) is the reward', () => {
+  assert.equal(HELD_TOKEN_SYMBOL, 'FRG');
+  assert.equal(REWARD_SYMBOL, 'USTC');
+  assert.equal(REWARD_DENOM, 'uusd');
+});
+
+test('accrual is denominated in USTC while FRG balances are only weights', () => {
+  // Pool: 10 USTC (10,000,000 uusd). Weights: A holds 3 FRG, B holds
+  // 1 FRG (base units). The USTC split follows the FRG weights, and
+  // the affiliate bonus is USTC too — no FRG amount is ever produced.
+  const { shares, bonuses } = computeDay(10_000_000n, [
+    { wallet: A, balance: 3_000_000n }, { wallet: B, balance: 1_000_000n },
+  ], new Map([[B, A]]), 1000);
+  assert.equal(shares.find((s) => s.wallet === A).amount, 7_500_000n); // 7.5 USTC
+  assert.equal(shares.find((s) => s.wallet === B).amount, 2_500_000n); // 2.5 USTC
+  assert.equal(bonuses.find((b) => b.wallet === A).amount, 250_000n); // 0.25 USTC
+});
 
 test('pro-rata split sums exactly to the pool', () => {
   const shares = computeShares(1_000_000n, [
