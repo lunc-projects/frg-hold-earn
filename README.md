@@ -1,6 +1,6 @@
 # 🌌 FRG Hold & Earn — Luna Classic
 
-Hold FRG in your own wallet, earn rewards. **Core hold-and-earn: no
+Hold FRG in your own wallet, earn USTC rewards. **Core hold-and-earn: no
 contracts, no staking, no cross-staking, no locking.** Holders keep
 their FRG in their own wallets at all times; they visit the website,
 connect, and Collect rewards. A separate opt-in NFT bonus section
@@ -29,21 +29,23 @@ for the days you were not holding.
    the weight of holding it all day, so flash-holding into the
    snapshot moment does not pay. A wallet with no samples that day
    falls back to a single live read at snapshot time.
-3. That day's configured reward pool splits **pro-rata** across those
-   average balances. The split sums **exactly** to the pool
-   (integer dust goes to the largest holder). Zero-balance holders
-   earn zero. A wallet earns only for days it appears in a snapshot.
+3. That day's configured **USTC** reward pool splits **pro-rata**
+   across those average FRG balances. The split sums **exactly** to
+   the pool (integer dust goes to the largest holder). Zero-balance
+   holders earn zero. A wallet earns only for days it appears in a
+   snapshot. FRG balances are only the weights — every reward amount
+   is USTC (denom `uusd`, 6 decimals).
 4. The holder clicks **Collect**. The backend recomputes what they are
    owed from snapshots minus what they have already been paid, and
-   pays it from the **payout wallet**. The frontend never decides an
-   amount — any amount it sends is ignored.
+   pays that USTC from the **payout wallet** by native bank send. The
+   frontend never decides an amount — any amount it sends is ignored.
 
 ## Safety rules (non-negotiable, enforced in code)
 
 - **No holder's FRG ever leaves their own wallet.** The ONLY wallet
   that ever sends is the payout wallet.
-- **The backend never pays more than the payout wallet's actual FRG
-  balance.** If the payout wallet is short, Collect fails with
+- **The backend never pays more than the payout wallet's actual USTC
+  balance.** If the payout wallet is short of USTC, Collect fails with
   "rewards pool empty, top up" and nothing is recorded as paid.
 - **Every Collect is verified server-side** from snapshots + the
   payment ledger. One wallet's claim can never exceed its own
@@ -58,7 +60,32 @@ for the days you were not holding.
   deducted from the referral's share or from other holders' shares.
   Consequence the admin must fund for: **one day's total cost = daily
   pool + referral bonuses.** The hard cap at payout time is the payout
-  wallet's actual FRG balance.
+  wallet's actual USTC balance.
+
+## USTC conversion migration (one-time, auditable)
+
+The base reward engine originally accrued FRG. On the **first boot
+under the USTC code**, `store.js` runs a one-time, flag-guarded
+migration (the `reward_currency_migrations` row is the flag):
+
+1. Every row then in the base `accruals` table (`share` + affiliate
+   `bonus`) is copied **verbatim** into `legacy_frg_accruals` — nothing
+   is silently deleted.
+2. The copied rows are removed from the active accrual ledger, so no
+   FRG-denominated amount can ever be collected as USTC. The migration
+   record stores the timestamp, the gross archived total, and the
+   archived **unpaid** total (accrued − pending/confirmed paid, per
+   wallet, floored at zero). `/api/admin` surfaces it as
+   `rewardMigration`, and the admin panel displays it when non-zero.
+3. The legacy daily-pool number is recorded in the migration row and
+   the active pool is **reset to 0** — an old FRG/day value is never
+   silently reinterpreted as the same number of USTC/day. The owner
+   sets the new USTC/day pool deliberately.
+4. The NFT bonus tables are **not** touched: that separate mechanic
+   remains FRG-denominated (see the NFT section below).
+
+Re-running the server never repeats the migration, and accruals
+recorded after the conversion (USTC) are never archived by it.
 
 ## Roles — settled 2026-10-24 (this app only)
 
@@ -81,7 +108,7 @@ Backend (from `server/`):
 
 ```sh
 npm install
-npm test          # 29 tests, must all pass
+npm test          # 69 tests, must all pass
 PORT=3001 node src/server.js
 ```
 
@@ -117,10 +144,11 @@ a single service can host both in production.
    Its **key goes into Railway as `FRG_PAYOUT_MNEMONIC`**, pasted by
    the owner himself into Railway env vars. Never send the key in
    chat, never put it in code, never log it.
-2. Fund the payout wallet with FRG for the reward pool **plus a little
-   LUNC for gas** (payouts are CW20 transfers, gas `0.15uluna`).
-   The admin panel shows its live FRG balance, so topping up is
-   visible before anyone Collects.
+2. Fund the payout wallet with **USTC for the reward pool plus a little
+   LUNC for gas** (base payouts are native bank sends of `uusd`, gas
+   `0.15uluna`). The owner deposits USTC himself. The admin panel
+   shows its live USTC balance (alongside the FRG balance), so a
+   deposit landing is visible before anyone Collects.
 3. Set `ADMIN_SECRET` in Railway (a secret only the owner knows).
 4. With the key absent, Collects fail safely with "payout wallet not
    configured yet" — no crash, no fake success. With the key present
@@ -150,14 +178,15 @@ yet — they are env vars with a TODO, not invented values.
 
 - [ ] Production durable store provisioned (Upstash Redis) and wired in.
 - [ ] `FRG_PAYOUT_MNEMONIC` + `ADMIN_SECRET` set in Railway by the owner.
-- [ ] Payout wallet funded with FRG + LUNC for gas.
+- [ ] Payout wallet funded with USTC (reward pool) + LUNC for gas.
 - [ ] WalletConnect metadata URL in `frontend/src/main.jsx` updated
       from its placeholder to the real deployed URL (currently a
       `lunc-projects.github.io/frg-hold-earn/` placeholder — NOT live).
 - [ ] Affiliate design session with the owner (rate, rules, wording)
       — the 10% default is proposed, not final.
-- [ ] Daily pool set by the owner (starts at 0 — rewards honestly
-      show "not started yet" until then).
+- [ ] Daily pool set by the owner **in USTC** (the conversion
+      migration resets it to 0 — rewards honestly show "not started
+      yet" until the owner sets a USTC/day pool).
 
 ## Project layout
 
@@ -178,9 +207,12 @@ frg-hold-earn/
       server.js        # endpoints, snapshot runner, admin gating
       engine.js        # pure BigInt earnings math
       store.js         # SQLite storage module (node:sqlite)
-      payout.js        # the ONLY sender (CosmJS CW20 transfer)
+      payout.js        # the ONLY sender (native USTC bank sends for
+                       # base rewards; FRG CW20 retained only for the
+                       # separate NFT bonus path)
     tests/
       engine.test.js store.test.js collect.test.js payout.test.js
+      sampling.test.js nft.test.js migration.test.js
 ```
 
 ## Design note
