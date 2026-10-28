@@ -25,3 +25,19 @@ export async function cw721Count(lcdUrl, collection, owner) {
   }
   return count;
 }
+
+// Consolidated count across ALL configured bonus collections: the
+// design (user-decided 2026-10-24) is one calculation per holder, so
+// tokens in every configured collection sum into a single number.
+// An empty list honestly counts 0 without any chain call. A chain
+// error on ANY collection throws — the caller (runSnapshot) treats
+// that as "skip the NFT bonus for this snapshot", never as a
+// partial count that would understate a holder's NFTs.
+export async function cw721CountMulti(lcdUrl, collections, owner) {
+  if (!collections || collections.length === 0) return 0;
+  let total = 0;
+  for (const collection of collections) {
+    total += await cw721Count(lcdUrl, collection, owner);
+  }
+  return total;
+}

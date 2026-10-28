@@ -59,7 +59,12 @@ export function computeNftDailyBonus(nftCount, bonusPerNftBase) {
 // by the caller. Throws Error with a plain message on the first bad
 // field — the admin endpoint turns that into a visible 400.
 // - collection: '' clears it (no collection configured); otherwise a
-//   valid Terra address.
+//   valid Terra address. This is the MINT collection (single).
+// - collections: the BONUS collections list — an array of valid Terra
+//   addresses whose holdings consolidate into one bonus count per
+//   holder. An empty array clears the list. Duplicates are dropped,
+//   order is preserved. (When the list is empty, the store falls back
+//   to the single `collection` above — see store.getNftCollections.)
 // - mintCostWhole / bonusPerNftWhole: whole-FRG decimal strings,
 //   must parse and be >= 0.
 // - threshold / supplyCap: non-negative integers (0 = unset / unlimited).
@@ -71,6 +76,17 @@ export function validateNftSettings(input) {
     const v = String(input.collection ?? '').trim();
     if (v !== '' && !isValidTerraAddress(v)) throw new Error('invalid NFT collection address');
     updates.collection = v;
+  }
+  if ('collections' in input) {
+    if (!Array.isArray(input.collections)) throw new Error('invalid NFT collections list');
+    const seen = new Set();
+    const list = [];
+    for (const raw of input.collections) {
+      const v = String(raw ?? '').trim();
+      if (!isValidTerraAddress(v)) throw new Error('invalid NFT collection address in collections list');
+      if (!seen.has(v)) { seen.add(v); list.push(v); }
+    }
+    updates.collections = list;
   }
   if ('mintCostWhole' in input) {
     updates.mintCost = parseAmount(input.mintCostWhole, 'invalid mint cost');

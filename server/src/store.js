@@ -15,6 +15,7 @@
 // swapping the backend later does not touch the earnings logic.
 // ─────────────────────────────────────────────────────────────
 import { DatabaseSync } from 'node:sqlite';
+import { isValidTerraAddress } from './engine.js';
 
 export function openStore(path) {
   const db = new DatabaseSync(path);
@@ -83,7 +84,8 @@ export function openStore(path) {
   // threshold 0 (unset), supply cap 0 (unlimited), no bonus pool
   // wallet (bonus payouts blocked until set), pool funded 0.
   db.prepare(`INSERT OR IGNORE INTO settings(key, value) VALUES
-              ('nft_collection', ''), ('nft_mint_cost', '0'),
+              ('nft_collection', ''), ('nft_collections', '[]'),
+              ('nft_mint_cost', '0'),
               ('nft_bonus_per_nft', '0'), ('nft_threshold', '0'),
               ('nft_supply_cap', '0'), ('nft_bonus_pool_wallet', ''),
               ('nft_bonus_pool_funded', '0')`).run();
@@ -360,6 +362,25 @@ export function openStore(path) {
 
     // --- NFT bonus settings (all admin-settable, never hardcoded) ---
     getNftCollection() { return q(`SELECT value FROM settings WHERE key='nft_collection'`).value; },
+    // Bonus collections list (JSON array in settings): the CW721
+    // collections whose holdings count toward the NFT bonus. A
+    // holder's tokens across ALL of them consolidate into one count.
+    // Falls back to the legacy single 'nft_collection' (the original
+    // bonus + mint collection) when the list was never set, so older
+    // deployments keep their exact behavior. The legacy value also
+    // remains the MINT collection — minting is a separate flow.
+    getNftCollections() {
+      let list = [];
+      try {
+        const raw = q(`SELECT value FROM settings WHERE key='nft_collections'`);
+        const parsed = raw ? JSON.parse(raw.value) : [];
+        if (Array.isArray(parsed)) list = parsed;
+      } catch { list = []; }
+      list = [...new Set(list.filter((a) => isValidTerraAddress(a)))];
+      if (list.length) return list;
+      const legacy = this.getNftCollection();
+      return legacy ? [legacy] : [];
+    },
     getNftMintCost() { return BigInt(q(`SELECT value FROM settings WHERE key='nft_mint_cost'`).value); },
     getNftBonusPerNft() { return BigInt(q(`SELECT value FROM settings WHERE key='nft_bonus_per_nft'`).value); },
     getNftThreshold() { return Number(q(`SELECT value FROM settings WHERE key='nft_threshold'`).value); },
@@ -368,6 +389,7 @@ export function openStore(path) {
     getNftSettings() {
       return {
         collection: this.getNftCollection(),
+        collections: this.getNftCollections(),
         mintCost: this.getNftMintCost(),
         bonusPerNft: this.getNftBonusPerNft(),
         threshold: this.getNftThreshold(),
@@ -377,15 +399,19 @@ export function openStore(path) {
     },
     setNftSettings(updates) {
       const map = {
-        collection: 'nft_collection', mintCost: 'nft_mint_cost',
+        collection: 'nft_collection', collections: 'nft_collections',
+        mintCost: 'nft_mint_cost',
         bonusPerNft: 'nft_bonus_per_nft', threshold: 'nft_threshold',
         supplyCap: 'nft_supply_cap', bonusPoolWallet: 'nft_bonus_pool_wallet',
       };
       for (const [field, key] of Object.entries(map)) {
         if (field in updates) {
+          const value = field === 'collections'
+            ? JSON.stringify(updates[field])
+            : String(updates[field]);
           run(`INSERT INTO settings(key, value) VALUES(?, ?)
                ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
-              key, String(updates[field]));
+              key, value);
         }
       }
     },

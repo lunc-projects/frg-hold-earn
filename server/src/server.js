@@ -34,7 +34,7 @@ import {
   validateNftSettings, validateFundingAmount,
   verifyMintTransfer, isValidTxhash,
 } from './nft.js';
-import { cw721Count } from './nftChain.js';
+import { cw721CountMulti } from './nftChain.js';
 
 // Admin wallet FOR THIS APP ONLY ("New admin" wallet, user-settled
 // 2026-10-24). Other apps keep their own admins — do not change them.
@@ -60,9 +60,13 @@ export function dayString(d = new Date()) {
 // sampler was down, or it registered after the last sample) falls
 // back to a live balance read, exactly the pre-upgrade behavior.
 // fetchNftCount (optional): when given, the same day also snapshots
-// each wallet's NFT count for the configured collection and accrues
-// NFT bonuses into the SEPARATE nft ledger. When omitted (old callers,
-// tests), the NFT side is skipped entirely — base behavior unchanged.
+// each wallet's consolidated NFT count across the configured bonus
+// collections and accrues NFT bonuses into the SEPARATE nft ledger.
+// When omitted (old callers, tests), the NFT side is skipped entirely
+// — base behavior unchanged. If any NFT read FAILS (e.g. the LCD is
+// down), the NFT day is skipped as a whole — no partial counts are
+// ever recorded — and the base snapshot still completes; the NFT day
+// can simply be recorded by a later run the same day.
 export async function runSnapshot(store, fetchBalance, day = dayString(), fetchNftCount = null) {
   const wallets = store.allWallets();
   const averages = store.averageBalances(day);
@@ -84,15 +88,22 @@ export async function runSnapshot(store, fetchBalance, day = dayString(), fetchN
   const total = balances.reduce((s, b) => s + b.balance, 0n);
   let nftOut = null;
   if (fetchNftCount) {
-    const nftCounts = [];
-    for (const w of wallets) {
-      nftCounts.push({ wallet: w.address, nftCount: await fetchNftCount(w.address) });
+    try {
+      const nftCounts = [];
+      for (const w of wallets) {
+        nftCounts.push({ wallet: w.address, nftCount: await fetchNftCount(w.address) });
+      }
+      const bonusPerNft = store.getNftBonusPerNft();
+      const nftBonuses = nftCounts.map(({ wallet, nftCount }) => ({
+        wallet, amount: computeNftDailyBonus(nftCount, bonusPerNft),
+      }));
+      nftOut = store.recordNftDay(day, nftCounts, nftBonuses);
+    } catch (e) {
+      // Bonus read failed: skip the NFT day entirely (nothing partial
+      // is recorded, so a retry today can still land it). The base
+      // snapshot above is already recorded and is never affected.
+      nftOut = { skipped: true, error: `NFT bonus snapshot skipped: ${e.message}` };
     }
-    const bonusPerNft = store.getNftBonusPerNft();
-    const nftBonuses = nftCounts.map(({ wallet, nftCount }) => ({
-      wallet, amount: computeNftDailyBonus(nftCount, bonusPerNft),
-    }));
-    nftOut = store.recordNftDay(day, nftCounts, nftBonuses);
   }
   return {
     day, wallets: balances.length, totalBalance: total.toString(), pool: pool.toString(),
@@ -196,6 +207,9 @@ export function createApp({ store, payout, config }) {
       return {
         configured: s.collection !== '',
         collection: s.collection,
+        collections: s.collections,
+        bonusCollectionsConfigured: s.collections.length > 0,
+        bonusRateSet: s.bonusPerNft > 0n,
         threshold: s.threshold,
         thresholdSet: s.threshold > 0,
         bonusPerNftWhole: formatBaseToWhole(s.bonusPerNft),
@@ -300,10 +314,20 @@ export function createApp({ store, payout, config }) {
   // pretends otherwise, anywhere in the app.
   function nftView(addr) {
     const s = store.getNftSettings();
-    const configured = s.collection !== '';
+    // Bonus configuration = the bonus collections list (which falls
+    // back to the legacy single collection when never set). Counts and
+    // power read against THAT; the mint fields below stay keyed to the
+    // single mint collection, a separate flow.
+    const configured = s.collections.length > 0;
     const count = configured ? store.latestNftCount(addr) : 0;
     const power = consolidateNftPower(count, s.threshold);
-    const mintReady = configured && s.mintCost > 0n && s.bonusPoolWallet !== '';
+    const bonusRateSet = s.bonusPerNft > 0n;
+    const bonusNotice = !configured
+      ? 'No NFT bonus collections are connected yet — NFT bonus holdings read as zero.'
+      : !bonusRateSet
+        ? 'NFT bonus collections are connected, but the bonus rate is not set yet — no NFT bonus accrues until the admin sets a bonus per NFT.'
+        : `NFT bonus is active: ${formatBaseToWhole(s.bonusPerNft)} FRG per NFT per snapshot day, counted across ${s.collections.length} connected collection${s.collections.length === 1 ? '' : 's'}.`;
+    const mintReady = s.collection !== '' && s.mintCost > 0n && s.bonusPoolWallet !== '';
     const mintNotice = !configured
       ? 'Minting is not open yet — no NFT collection is configured.'
       : s.mintCost <= 0n
@@ -315,6 +339,9 @@ export function createApp({ store, payout, config }) {
       address: addr,
       configured,
       collection: s.collection,
+      collections: s.collections,
+      bonusRateSet,
+      bonusNotice,
       mintReady,
       mintNotice,
       nftCount: power.nftCount,
@@ -466,6 +493,8 @@ export function createApp({ store, payout, config }) {
         const s = store.getNftSettings();
         return {
           collection: s.collection,
+          collections: s.collections,
+          bonusRateSet: s.bonusPerNft > 0n,
           mintCostWhole: formatBaseToWhole(s.mintCost),
           bonusPerNftWhole: formatBaseToWhole(s.bonusPerNft),
           threshold: s.threshold,
@@ -502,7 +531,7 @@ export function createApp({ store, payout, config }) {
   app.post('/api/admin/snapshot', requireAdmin, async (_req, res) => {
     try {
       const out = await runSnapshot(store, (addr) => cw20Balance(config.lcdUrl, FRG_TOKEN, addr),
-        dayString(), (addr) => cw721Count(config.lcdUrl, store.getNftCollection(), addr));
+        dayString(), (addr) => cw721CountMulti(config.lcdUrl, store.getNftCollections(), addr));
       res.json(out);
     } catch (e) {
       bad(res, 502, `snapshot failed: ${e.message}`);
@@ -514,6 +543,8 @@ export function createApp({ store, payout, config }) {
     const s = store.getNftSettings();
     res.json({
       collection: s.collection,
+      collections: s.collections,
+      bonusRateSet: s.bonusPerNft > 0n,
       mintCost: s.mintCost.toString(),
       mintCostWhole: formatBaseToWhole(s.mintCost),
       bonusPerNft: s.bonusPerNft.toString(),
@@ -537,6 +568,8 @@ export function createApp({ store, payout, config }) {
       const s = store.getNftSettings();
       res.json({
         collection: s.collection,
+        collections: s.collections,
+        bonusRateSet: s.bonusPerNft > 0n,
         mintCost: s.mintCost.toString(),
         mintCostWhole: formatBaseToWhole(s.mintCost),
         bonusPerNft: s.bonusPerNft.toString(),
@@ -612,7 +645,7 @@ if (import.meta.url === `file://${process.argv[1]}`) {
   });
   const app = createApp({ store, payout, config });
   const fetchBalance = (addr) => cw20Balance(config.lcdUrl, FRG_TOKEN, addr);
-  const fetchNftCount = (addr) => cw721Count(config.lcdUrl, store.getNftCollection(), addr);
+  const fetchNftCount = (addr) => cw721CountMulti(config.lcdUrl, store.getNftCollections(), addr);
   setInterval(() => {
     runSnapshot(store, fetchBalance, dayString(), fetchNftCount).then(
       (r) => console.log('snapshot', r.day, r.skipped ? 'skipped (already done)' : `${r.wallets} wallets`),
