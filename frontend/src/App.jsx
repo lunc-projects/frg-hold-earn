@@ -35,6 +35,7 @@ export default function App() {
   const [poolInput, setPoolInput] = useState('');
   const [rateInput, setRateInput] = useState('');
   const [nftCollectionInput, setNftCollectionInput] = useState('');
+  const [nftCollectionsInput, setNftCollectionsInput] = useState('');
   const [nftMintInput, setNftMintInput] = useState('');
   const [nftBonusInput, setNftBonusInput] = useState('');
   const [nftThresholdInput, setNftThresholdInput] = useState('');
@@ -173,10 +174,21 @@ export default function App() {
     try {
       const out = await getAdminNft(adminSecret, address);
       setAdminNft(out);
+      setNftCollectionsInput((out.collections || []).join('\n'));
       pushLog('NFT admin stats ✅');
     } catch (e) {
       pushLog(`NFT admin stats failed: ${e.message}`);
     }
+  };
+
+  // Bonus collections are saved as a complete list (one address per
+  // line): whatever is in the box REPLACES the list, so an empty box
+  // deliberately disconnects all bonus collections. This is separate
+  // from the blank-means-unchanged fields above.
+  const saveBonusCollections = async () => {
+    const list = nftCollectionsInput.split(/[\s,]+/).map((s) => s.trim()).filter(Boolean);
+    await doAdmin('Bonus collections saved', () => adminSetNftSettings(adminSecret, address, { collections: list }));
+    await loadAdminNft();
   };
 
   // Save only fields the admin actually typed — a blank field leaves
@@ -256,12 +268,15 @@ export default function App() {
                 ? ` At ${nft.threshold} NFTs the battery shows fully powered.`
                 : ' The admin has not set the fully-powered threshold yet.')}</p>
             {nft && !nft.configured && (
-              <p className="warn">No NFT collection is configured yet — bonus holdings read as zero. Minting is not open yet.</p>
+              <p className="warn">{nft.bonusNotice || 'No NFT bonus collections are connected yet — bonus holdings read as zero.'} Minting is not open yet.</p>
+            )}
+            {nft?.configured && !nft.bonusRateSet && (
+              <p className="warn">{nft.bonusNotice}</p>
             )}
             {nft?.configured && (
               <>
                 <p>Bonus accrued: {toWhole(nft.accrued)} FRG · Ready to collect: <span className="big gold">{toWhole(nft.claimable)}</span> FRG</p>
-                <p className="muted">Bonus rate: {toWhole(nft.bonusPerNft)} FRG per NFT per snapshot day
+                <p className="muted">Bonus rate: {nft.bonusRateSet ? `${toWhole(nft.bonusPerNft)} FRG per NFT per snapshot day` : 'not set yet — no NFT bonus accrues'}
                   · Mint price: {toWhole(nft.mintCost)} FRG
                   · Bonus pool available: {toWhole(nft.bonusPoolAvailable)} FRG</p>
                 {nft.lastSnapshotDay === null && (
@@ -335,6 +350,8 @@ export default function App() {
               <p>Snapshot days: {adminStats.snapshotDays.length ? adminStats.snapshotDays.join(', ') : 'none yet'}</p>
               {adminStats.nft && (
                 <p>NFT: collection {adminStats.nft.collection || 'not configured'}
+                  {' · '}bonus collections {(adminStats.nft.collections || []).length} connected
+                  {adminStats.nft.bonusRateSet ? '' : ' (rate not set yet)'}
                   {' · '}mint {adminStats.nft.mintCostWhole} FRG
                   {' · '}bonus {adminStats.nft.bonusPerNftWhole} FRG/NFT/day
                   {' · '}threshold {adminStats.nft.threshold}
@@ -356,6 +373,12 @@ export default function App() {
           {adminNft && (
             <div className="adminstats">
               <p>Collection: {adminNft.collection ? <span className="mono">{adminNft.collection}</span> : 'not configured'}</p>
+              <p>Bonus collections: {(adminNft.collections || []).length
+                ? adminNft.collections.map((c) => <span key={c} className="mono">{c}<br /></span>)
+                : 'none connected — NFT bonus counts read as zero'}</p>
+              <p>Bonus rate: {adminNft.bonusRateSet
+                ? `${adminNft.bonusPerNftWhole} FRG per NFT per day`
+                : 'not set yet — collections are connected but no NFT bonus accrues'}</p>
               <p>Mint price: {adminNft.mintCostWhole} FRG · Bonus: {adminNft.bonusPerNftWhole} FRG per NFT per day</p>
               <p>Threshold: {adminNft.threshold} · Supply cap: {adminNft.supplyCap || 'unlimited'}</p>
               <p>Bonus pool wallet: {adminNft.bonusPoolWallet ? <span className="mono">{adminNft.bonusPoolWallet}</span> : 'not set — bonus payouts are blocked until it is set'}</p>
@@ -363,7 +386,10 @@ export default function App() {
               <p>NFT snapshot days: {adminNft.snapshotDays.length ? adminNft.snapshotDays.join(', ') : 'none yet'}</p>
             </div>
           )}
-          <label className="muted" htmlFor="nft-collection-input">NFT collection address (CW721)</label>
+          <label className="muted" htmlFor="nft-collections-input">Bonus collections (CW721 addresses, one per line — holdings across all of them count as one NFT total per holder). This box replaces the whole list when saved; empty disconnects all bonus collections.</label>
+          <textarea id="nft-collections-input" rows="3" placeholder="terra1…" value={nftCollectionsInput} onChange={(e) => setNftCollectionsInput(e.target.value)} />
+          <button className="cyan" onClick={saveBonusCollections}>Save bonus collections</button>
+          <label className="muted" htmlFor="nft-collection-input">NFT collection address (CW721 — mint collection)</label>
           <input id="nft-collection-input" placeholder="terra1…" value={nftCollectionInput} onChange={(e) => setNftCollectionInput(e.target.value)} />
           <label className="muted" htmlFor="nft-mint-input">Mint price (FRG)</label>
           <input id="nft-mint-input" type="number" min="0" step="any" placeholder="e.g. 1000" value={nftMintInput} onChange={(e) => setNftMintInput(e.target.value)} />
