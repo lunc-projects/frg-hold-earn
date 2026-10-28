@@ -85,6 +85,7 @@ export function openStore(path) {
   // wallet (bonus payouts blocked until set), pool funded 0.
   db.prepare(`INSERT OR IGNORE INTO settings(key, value) VALUES
               ('nft_collection', ''), ('nft_collections', '[]'),
+              ('nft_excluded_wallets', '[]'),
               ('nft_mint_cost', '0'),
               ('nft_bonus_per_nft', '0'), ('nft_threshold', '0'),
               ('nft_supply_cap', '0'), ('nft_bonus_pool_wallet', ''),
@@ -381,6 +382,21 @@ export function openStore(path) {
       const legacy = this.getNftCollection();
       return legacy ? [legacy] : [];
     },
+    // Excluded wallets list (JSON array in settings): wallets that
+    // NEVER count toward the NFT bonus — e.g. the owner's own wallet
+    // holding unsold bonus stock bought to give away. A snapshot
+    // records 0 for them without any chain read; their BASE
+    // hold-and-earn rewards are completely unaffected. Admin-set
+    // only, empty by default, no legacy fallback.
+    getNftExcludedWallets() {
+      let list = [];
+      try {
+        const raw = q(`SELECT value FROM settings WHERE key='nft_excluded_wallets'`);
+        const parsed = raw ? JSON.parse(raw.value) : [];
+        if (Array.isArray(parsed)) list = parsed;
+      } catch { list = []; }
+      return [...new Set(list.filter((a) => isValidTerraAddress(a)))];
+    },
     getNftMintCost() { return BigInt(q(`SELECT value FROM settings WHERE key='nft_mint_cost'`).value); },
     getNftBonusPerNft() { return BigInt(q(`SELECT value FROM settings WHERE key='nft_bonus_per_nft'`).value); },
     getNftThreshold() { return Number(q(`SELECT value FROM settings WHERE key='nft_threshold'`).value); },
@@ -390,6 +406,7 @@ export function openStore(path) {
       return {
         collection: this.getNftCollection(),
         collections: this.getNftCollections(),
+        excludedWallets: this.getNftExcludedWallets(),
         mintCost: this.getNftMintCost(),
         bonusPerNft: this.getNftBonusPerNft(),
         threshold: this.getNftThreshold(),
@@ -400,13 +417,14 @@ export function openStore(path) {
     setNftSettings(updates) {
       const map = {
         collection: 'nft_collection', collections: 'nft_collections',
+        excludedWallets: 'nft_excluded_wallets',
         mintCost: 'nft_mint_cost',
         bonusPerNft: 'nft_bonus_per_nft', threshold: 'nft_threshold',
         supplyCap: 'nft_supply_cap', bonusPoolWallet: 'nft_bonus_pool_wallet',
       };
       for (const [field, key] of Object.entries(map)) {
         if (field in updates) {
-          const value = field === 'collections'
+          const value = field === 'collections' || field === 'excludedWallets'
             ? JSON.stringify(updates[field])
             : String(updates[field]);
           run(`INSERT INTO settings(key, value) VALUES(?, ?)

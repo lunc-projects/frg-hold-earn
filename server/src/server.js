@@ -67,6 +67,10 @@ export function dayString(d = new Date()) {
 // down), the NFT day is skipped as a whole — no partial counts are
 // ever recorded — and the base snapshot still completes; the NFT day
 // can simply be recorded by a later run the same day.
+// Wallets on the admin-set exclusion list (nft_excluded_wallets, e.g.
+// the owner's own bonus-stock wallet) are recorded with an NFT count
+// of 0 WITHOUT any chain read and never accrue NFT bonus; their base
+// rewards above are completely unaffected.
 export async function runSnapshot(store, fetchBalance, day = dayString(), fetchNftCount = null) {
   const wallets = store.allWallets();
   const averages = store.averageBalances(day);
@@ -89,9 +93,13 @@ export async function runSnapshot(store, fetchBalance, day = dayString(), fetchN
   let nftOut = null;
   if (fetchNftCount) {
     try {
+      const excludedWallets = new Set(store.getNftExcludedWallets());
       const nftCounts = [];
       for (const w of wallets) {
-        nftCounts.push({ wallet: w.address, nftCount: await fetchNftCount(w.address) });
+        nftCounts.push({
+          wallet: w.address,
+          nftCount: excludedWallets.has(w.address) ? 0 : await fetchNftCount(w.address),
+        });
       }
       const bonusPerNft = store.getNftBonusPerNft();
       const nftBonuses = nftCounts.map(({ wallet, nftCount }) => ({
@@ -208,6 +216,7 @@ export function createApp({ store, payout, config }) {
         configured: s.collection !== '',
         collection: s.collection,
         collections: s.collections,
+        excludedWallets: s.excludedWallets,
         bonusCollectionsConfigured: s.collections.length > 0,
         bonusRateSet: s.bonusPerNft > 0n,
         threshold: s.threshold,
@@ -340,6 +349,8 @@ export function createApp({ store, payout, config }) {
       configured,
       collection: s.collection,
       collections: s.collections,
+      excludedWallets: s.excludedWallets,
+      walletExcluded: s.excludedWallets.includes(addr),
       bonusRateSet,
       bonusNotice,
       mintReady,
@@ -494,6 +505,7 @@ export function createApp({ store, payout, config }) {
         return {
           collection: s.collection,
           collections: s.collections,
+          excludedWallets: s.excludedWallets,
           bonusRateSet: s.bonusPerNft > 0n,
           mintCostWhole: formatBaseToWhole(s.mintCost),
           bonusPerNftWhole: formatBaseToWhole(s.bonusPerNft),
@@ -544,6 +556,7 @@ export function createApp({ store, payout, config }) {
     res.json({
       collection: s.collection,
       collections: s.collections,
+      excludedWallets: s.excludedWallets,
       bonusRateSet: s.bonusPerNft > 0n,
       mintCost: s.mintCost.toString(),
       mintCostWhole: formatBaseToWhole(s.mintCost),
@@ -569,6 +582,7 @@ export function createApp({ store, payout, config }) {
       res.json({
         collection: s.collection,
         collections: s.collections,
+        excludedWallets: s.excludedWallets,
         bonusRateSet: s.bonusPerNft > 0n,
         mintCost: s.mintCost.toString(),
         mintCostWhole: formatBaseToWhole(s.mintCost),

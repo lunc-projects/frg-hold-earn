@@ -65,6 +65,10 @@ export function computeNftDailyBonus(nftCount, bonusPerNftBase) {
 //   holder. An empty array clears the list. Duplicates are dropped,
 //   order is preserved. (When the list is empty, the store falls back
 //   to the single `collection` above — see store.getNftCollections.)
+// - excludedWallets: wallets that never count toward the NFT bonus
+//   (e.g. the owner's own bonus-stock wallet). Same list rules as
+//   `collections`: array of valid Terra addresses, duplicates
+//   dropped, empty array clears the list.
 // - mintCostWhole / bonusPerNftWhole: whole-FRG decimal strings,
 //   must parse and be >= 0.
 // - threshold / supplyCap: non-negative integers (0 = unset / unlimited).
@@ -87,6 +91,17 @@ export function validateNftSettings(input) {
       if (!seen.has(v)) { seen.add(v); list.push(v); }
     }
     updates.collections = list;
+  }
+  if ('excludedWallets' in input) {
+    if (!Array.isArray(input.excludedWallets)) throw new Error('invalid NFT excluded wallets list');
+    const seen = new Set();
+    const list = [];
+    for (const raw of input.excludedWallets) {
+      const v = String(raw ?? '').trim();
+      if (!isValidTerraAddress(v)) throw new Error('invalid NFT wallet address in excluded wallets list');
+      if (!seen.has(v)) { seen.add(v); list.push(v); }
+    }
+    updates.excludedWallets = list;
   }
   if ('mintCostWhole' in input) {
     updates.mintCost = parseAmount(input.mintCostWhole, 'invalid mint cost');
