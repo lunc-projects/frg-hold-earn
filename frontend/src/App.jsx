@@ -36,6 +36,7 @@ export default function App() {
   const [rateInput, setRateInput] = useState('');
   const [nftCollectionInput, setNftCollectionInput] = useState('');
   const [nftCollectionsInput, setNftCollectionsInput] = useState('');
+  const [nftExcludedInput, setNftExcludedInput] = useState('');
   const [nftMintInput, setNftMintInput] = useState('');
   const [nftBonusInput, setNftBonusInput] = useState('');
   const [nftThresholdInput, setNftThresholdInput] = useState('');
@@ -175,6 +176,7 @@ export default function App() {
       const out = await getAdminNft(adminSecret, address);
       setAdminNft(out);
       setNftCollectionsInput((out.collections || []).join('\n'));
+      setNftExcludedInput((out.excludedWallets || []).join('\n'));
       pushLog('NFT admin stats ✅');
     } catch (e) {
       pushLog(`NFT admin stats failed: ${e.message}`);
@@ -188,6 +190,16 @@ export default function App() {
   const saveBonusCollections = async () => {
     const list = nftCollectionsInput.split(/[\s,]+/).map((s) => s.trim()).filter(Boolean);
     await doAdmin('Bonus collections saved', () => adminSetNftSettings(adminSecret, address, { collections: list }));
+    await loadAdminNft();
+  };
+
+  // Excluded wallets are saved the same way: the box REPLACES the
+  // whole list, so an empty box clears all exclusions. Excluded
+  // wallets record an NFT count of 0 and never accrue NFT bonus;
+  // their base hold-and-earn rewards are unaffected.
+  const saveExcludedWallets = async () => {
+    const list = nftExcludedInput.split(/[\s,]+/).map((s) => s.trim()).filter(Boolean);
+    await doAdmin('Excluded wallets saved', () => adminSetNftSettings(adminSecret, address, { excludedWallets: list }));
     await loadAdminNft();
   };
 
@@ -376,6 +388,9 @@ export default function App() {
               <p>Bonus collections: {(adminNft.collections || []).length
                 ? adminNft.collections.map((c) => <span key={c} className="mono">{c}<br /></span>)
                 : 'none connected — NFT bonus counts read as zero'}</p>
+              <p>Excluded wallets (no NFT bonus): {(adminNft.excludedWallets || []).length
+                ? adminNft.excludedWallets.map((c) => <span key={c} className="mono">{c}<br /></span>)
+                : 'none — every wallet counts'}</p>
               <p>Bonus rate: {adminNft.bonusRateSet
                 ? `${adminNft.bonusPerNftWhole} FRG per NFT per day`
                 : 'not set yet — collections are connected but no NFT bonus accrues'}</p>
@@ -389,6 +404,9 @@ export default function App() {
           <label className="muted" htmlFor="nft-collections-input">Bonus collections (CW721 addresses, one per line — holdings across all of them count as one NFT total per holder). This box replaces the whole list when saved; empty disconnects all bonus collections.</label>
           <textarea id="nft-collections-input" rows="3" placeholder="terra1…" value={nftCollectionsInput} onChange={(e) => setNftCollectionsInput(e.target.value)} />
           <button className="cyan" onClick={saveBonusCollections}>Save bonus collections</button>
+          <label className="muted" htmlFor="nft-excluded-input">Excluded wallets (no NFT bonus) — wallet addresses, one per line. These wallets record an NFT count of 0 and never accrue NFT bonus; their base hold-and-earn rewards are unaffected. This box replaces the whole list when saved; empty clears all exclusions.</label>
+          <textarea id="nft-excluded-input" rows="3" placeholder="terra1…" value={nftExcludedInput} onChange={(e) => setNftExcludedInput(e.target.value)} />
+          <button className="cyan" onClick={saveExcludedWallets}>Save excluded wallets</button>
           <label className="muted" htmlFor="nft-collection-input">NFT collection address (CW721 — mint collection)</label>
           <input id="nft-collection-input" placeholder="terra1…" value={nftCollectionInput} onChange={(e) => setNftCollectionInput(e.target.value)} />
           <label className="muted" htmlFor="nft-mint-input">Mint price (FRG)</label>
