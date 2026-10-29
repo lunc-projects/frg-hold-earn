@@ -38,7 +38,9 @@ export default function App() {
   const [nftCollectionsInput, setNftCollectionsInput] = useState('');
   const [nftExcludedInput, setNftExcludedInput] = useState('');
   const [nftMintInput, setNftMintInput] = useState('');
-  const [nftBonusInput, setNftBonusInput] = useState('');
+  const [nftRateBonusInput, setNftRateBonusInput] = useState('');
+  const [nftRateCommonInput, setNftRateCommonInput] = useState('');
+  const [nftRateUncommonInput, setNftRateUncommonInput] = useState('');
   const [nftThresholdInput, setNftThresholdInput] = useState('');
   const [nftCapInput, setNftCapInput] = useState('');
   const [nftPoolWalletInput, setNftPoolWalletInput] = useState('');
@@ -210,7 +212,9 @@ export default function App() {
     const body = {};
     if (nftCollectionInput.trim() !== '') body.collection = nftCollectionInput.trim();
     if (nftMintInput !== '') body.mintCostWhole = nftMintInput;
-    if (nftBonusInput !== '') body.bonusPerNftWhole = nftBonusInput;
+    if (nftRateBonusInput !== '') body.bonusRateBonusWhole = nftRateBonusInput;
+    if (nftRateCommonInput !== '') body.bonusRateCommonWhole = nftRateCommonInput;
+    if (nftRateUncommonInput !== '') body.bonusRateUncommonWhole = nftRateUncommonInput;
     if (nftThresholdInput !== '') body.threshold = nftThresholdInput;
     if (nftCapInput !== '') body.supplyCap = nftCapInput;
     if (nftPoolWalletInput.trim() !== '') body.bonusPoolWallet = nftPoolWalletInput.trim();
@@ -288,7 +292,10 @@ export default function App() {
             {nft?.configured && (
               <>
                 <p>Bonus accrued: {toWhole(nft.accrued)} FRG · Ready to collect: <span className="big gold">{toWhole(nft.claimable)}</span> FRG</p>
-                <p className="muted">Bonus rate: {nft.bonusRateSet ? `${toWhole(nft.bonusPerNft)} FRG per NFT per snapshot day` : 'not set yet — no NFT bonus accrues'}
+                {nft.nftTypeCounts && (
+                  <p className="muted">Your NFTs by type: {nft.nftTypeCounts.bonus} Bonus · {nft.nftTypeCounts.common} Common · {nft.nftTypeCounts.uncommon} Uncommon</p>
+                )}
+                <p className="muted">Bonus rates: {nft.bonusRateSet && nft.bonusRates ? `Bonus ${toWhole(nft.bonusRates.bonus)} · Common ${toWhole(nft.bonusRates.common)} · Uncommon ${toWhole(nft.bonusRates.uncommon)} FRG per NFT per snapshot day` : 'not set yet — no NFT bonus accrues'}
                   · Mint price: {toWhole(nft.mintCost)} FRG
                   · Bonus pool available: {toWhole(nft.bonusPoolAvailable)} FRG</p>
                 {nft.lastSnapshotDay === null && (
@@ -365,7 +372,7 @@ export default function App() {
                   {' · '}bonus collections {(adminStats.nft.collections || []).length} connected
                   {adminStats.nft.bonusRateSet ? '' : ' (rate not set yet)'}
                   {' · '}mint {adminStats.nft.mintCostWhole} FRG
-                  {' · '}bonus {adminStats.nft.bonusPerNftWhole} FRG/NFT/day
+                  {adminStats.nft.bonusRatesWhole && <>{' · '}bonus rates B {adminStats.nft.bonusRatesWhole.bonus} / C {adminStats.nft.bonusRatesWhole.common} / U {adminStats.nft.bonusRatesWhole.uncommon} FRG/day</>}
                   {' · '}threshold {adminStats.nft.threshold}
                   {' · '}cap {adminStats.nft.supplyCap || 'unlimited'}
                   {' · '}bonus pool available {adminStats.nft.bonusPoolAvailableWhole} FRG</p>
@@ -391,10 +398,10 @@ export default function App() {
               <p>Excluded wallets (no NFT bonus): {(adminNft.excludedWallets || []).length
                 ? adminNft.excludedWallets.map((c) => <span key={c} className="mono">{c}<br /></span>)
                 : 'none — every wallet counts'}</p>
-              <p>Bonus rate: {adminNft.bonusRateSet
-                ? `${adminNft.bonusPerNftWhole} FRG per NFT per day`
+              <p>Bonus rates: {adminNft.bonusRateSet && adminNft.bonusRatesWhole
+                ? `Bonus ${adminNft.bonusRatesWhole.bonus} · Common ${adminNft.bonusRatesWhole.common} · Uncommon ${adminNft.bonusRatesWhole.uncommon} FRG per NFT per day`
                 : 'not set yet — collections are connected but no NFT bonus accrues'}</p>
-              <p>Mint price: {adminNft.mintCostWhole} FRG · Bonus: {adminNft.bonusPerNftWhole} FRG per NFT per day</p>
+              <p>Mint price: {adminNft.mintCostWhole} FRG</p>
               <p>Threshold: {adminNft.threshold} · Supply cap: {adminNft.supplyCap || 'unlimited'}</p>
               <p>Bonus pool wallet: {adminNft.bonusPoolWallet ? <span className="mono">{adminNft.bonusPoolWallet}</span> : 'not set — bonus payouts are blocked until it is set'}</p>
               <p>Bonus pool: funded {adminNft.bonusPoolFundedWhole} FRG · available {adminNft.bonusPoolAvailableWhole} FRG · paid {toWhole(adminNft.bonusPoolPaid)} FRG</p>
@@ -411,8 +418,12 @@ export default function App() {
           <input id="nft-collection-input" placeholder="terra1…" value={nftCollectionInput} onChange={(e) => setNftCollectionInput(e.target.value)} />
           <label className="muted" htmlFor="nft-mint-input">Mint price (FRG)</label>
           <input id="nft-mint-input" type="number" min="0" step="any" placeholder="e.g. 1000" value={nftMintInput} onChange={(e) => setNftMintInput(e.target.value)} />
-          <label className="muted" htmlFor="nft-bonus-input">Bonus per NFT per day (FRG)</label>
-          <input id="nft-bonus-input" type="number" min="0" step="any" placeholder="e.g. 5" value={nftBonusInput} onChange={(e) => setNftBonusInput(e.target.value)} />
+          <label className="muted" htmlFor="nft-rate-bonus-input">Bonus rate — Bonus NFTs (the default type, no rarity) (FRG per day)</label>
+          <input id="nft-rate-bonus-input" type="number" min="0" step="any" placeholder="e.g. 4" value={nftRateBonusInput} onChange={(e) => setNftRateBonusInput(e.target.value)} />
+          <label className="muted" htmlFor="nft-rate-common-input">Bonus rate — Common NFTs (FRG per day)</label>
+          <input id="nft-rate-common-input" type="number" min="0" step="any" placeholder="e.g. 50" value={nftRateCommonInput} onChange={(e) => setNftRateCommonInput(e.target.value)} />
+          <label className="muted" htmlFor="nft-rate-uncommon-input">Bonus rate — Uncommon NFTs (FRG per day)</label>
+          <input id="nft-rate-uncommon-input" type="number" min="0" step="any" placeholder="e.g. 100" value={nftRateUncommonInput} onChange={(e) => setNftRateUncommonInput(e.target.value)} />
           <label className="muted" htmlFor="nft-threshold-input">Fully-powered threshold (NFT count, 0 = unset)</label>
           <input id="nft-threshold-input" type="number" min="0" step="1" placeholder="e.g. 10" value={nftThresholdInput} onChange={(e) => setNftThresholdInput(e.target.value)} />
           <label className="muted" htmlFor="nft-cap-input">Supply cap (0 = unlimited)</label>
