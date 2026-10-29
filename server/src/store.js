@@ -15,7 +15,7 @@
 // swapping the backend later does not touch the earnings logic.
 // ─────────────────────────────────────────────────────────────
 import { DatabaseSync } from 'node:sqlite';
-import { isValidTerraAddress } from './engine.js';
+import { isValidTerraAddress, isValidTerraContractAddress } from './engine.js';
 
 export function openStore(path) {
   const db = new DatabaseSync(path);
@@ -80,16 +80,36 @@ export function openStore(path) {
   db.prepare(`INSERT OR IGNORE INTO settings(key, value)
               VALUES('daily_pool', '0'), ('affiliate_rate_bps', '1000')`).run();
   // NFT defaults (only when never set): no collection configured
-  // (bonus holdings read as zero), mint cost 0, bonus per NFT 0,
-  // threshold 0 (unset), supply cap 0 (unlimited), no bonus pool
-  // wallet (bonus payouts blocked until set), pool funded 0.
+  // (bonus holdings read as zero), mint cost 0, threshold 0 (unset),
+  // supply cap 0 (unlimited), no bonus pool wallet (bonus payouts
+  // blocked until set), pool funded 0. Per-type bonus rates ship at
+  // the owner-decided mirror of the old FRG app (2026-10-28):
+  // Bonus 4, Common 50, Uncommon 100 FRG/day, in 6-decimal base
+  // units — INSERT OR IGNORE, so an admin-changed rate is never
+  // reset by a restart. ('nft_bonus_per_nft' is the retired flat
+  // rate; the row is left in place on older databases, unused.)
   db.prepare(`INSERT OR IGNORE INTO settings(key, value) VALUES
               ('nft_collection', ''), ('nft_collections', '[]'),
               ('nft_excluded_wallets', '[]'),
               ('nft_mint_cost', '0'),
               ('nft_bonus_per_nft', '0'), ('nft_threshold', '0'),
               ('nft_supply_cap', '0'), ('nft_bonus_pool_wallet', ''),
-              ('nft_bonus_pool_funded', '0')`).run();
+              ('nft_bonus_pool_funded', '0'),
+              ('nft_bonus_rate_bonus', '4000000'),
+              ('nft_bonus_rate_common', '50000000'),
+              ('nft_bonus_rate_uncommon', '100000000')`).run();
+  // Per-type snapshot counts (2026-10-29): nft_snapshots gains one
+  // column per bonus type. Rows written before this upgrade keep
+  // their exact nft_count total and read 0 per type — their type
+  // split was never read, and 0 is the honest record of that.
+  {
+    const cols = db.prepare(`PRAGMA table_info(nft_snapshots)`).all().map((r) => r.name);
+    for (const col of ['count_bonus', 'count_common', 'count_uncommon']) {
+      if (!cols.includes(col)) {
+        db.exec(`ALTER TABLE nft_snapshots ADD COLUMN ${col} INTEGER NOT NULL DEFAULT 0`);
+      }
+    }
+  }
 
   const q = (sql, ...args) => db.prepare(sql).get(...args);
   const all = (sql, ...args) => db.prepare(sql).all(...args);
@@ -377,7 +397,9 @@ export function openStore(path) {
         const parsed = raw ? JSON.parse(raw.value) : [];
         if (Array.isArray(parsed)) list = parsed;
       } catch { list = []; }
-      list = [...new Set(list.filter((a) => isValidTerraAddress(a)))];
+      // Collections are contracts (64-char addresses); the 44-char
+      // wallet shape is also kept for historical stored values.
+      list = [...new Set(list.filter((a) => isValidTerraAddress(a) || isValidTerraContractAddress(a)))];
       if (list.length) return list;
       const legacy = this.getNftCollection();
       return legacy ? [legacy] : [];
@@ -398,7 +420,21 @@ export function openStore(path) {
       return [...new Set(list.filter((a) => isValidTerraAddress(a)))];
     },
     getNftMintCost() { return BigInt(q(`SELECT value FROM settings WHERE key='nft_mint_cost'`).value); },
-    getNftBonusPerNft() { return BigInt(q(`SELECT value FROM settings WHERE key='nft_bonus_per_nft'`).value); },
+    // Per-type daily bonus rates (base units): { bonus, common,
+    // uncommon }. Defaults ship at the owner-decided 4 / 50 / 100
+    // FRG (see the defaults insert above); each is independently
+    // admin-settable, and 0 disables that type's bonus.
+    getNftBonusRates() {
+      const rate = (key) => {
+        const r = q(`SELECT value FROM settings WHERE key = ?`, key);
+        return r ? BigInt(r.value) : 0n;
+      };
+      return {
+        bonus: rate('nft_bonus_rate_bonus'),
+        common: rate('nft_bonus_rate_common'),
+        uncommon: rate('nft_bonus_rate_uncommon'),
+      };
+    },
     getNftThreshold() { return Number(q(`SELECT value FROM settings WHERE key='nft_threshold'`).value); },
     getNftSupplyCap() { return Number(q(`SELECT value FROM settings WHERE key='nft_supply_cap'`).value); },
     getNftBonusPoolWallet() { return q(`SELECT value FROM settings WHERE key='nft_bonus_pool_wallet'`).value; },
@@ -408,7 +444,7 @@ export function openStore(path) {
         collections: this.getNftCollections(),
         excludedWallets: this.getNftExcludedWallets(),
         mintCost: this.getNftMintCost(),
-        bonusPerNft: this.getNftBonusPerNft(),
+        bonusRates: this.getNftBonusRates(),
         threshold: this.getNftThreshold(),
         supplyCap: this.getNftSupplyCap(),
         bonusPoolWallet: this.getNftBonusPoolWallet(),
@@ -419,7 +455,10 @@ export function openStore(path) {
         collection: 'nft_collection', collections: 'nft_collections',
         excludedWallets: 'nft_excluded_wallets',
         mintCost: 'nft_mint_cost',
-        bonusPerNft: 'nft_bonus_per_nft', threshold: 'nft_threshold',
+        bonusRateBonus: 'nft_bonus_rate_bonus',
+        bonusRateCommon: 'nft_bonus_rate_common',
+        bonusRateUncommon: 'nft_bonus_rate_uncommon',
+        threshold: 'nft_threshold',
         supplyCap: 'nft_supply_cap', bonusPoolWallet: 'nft_bonus_pool_wallet',
       };
       for (const [field, key] of Object.entries(map)) {
@@ -435,15 +474,22 @@ export function openStore(path) {
     },
 
     // --- NFT snapshot + accrual (idempotent per day, like recordDay) ---
-    // counts: [{wallet, nftCount}], bonuses: [{wallet, amount: BigInt}].
+    // counts: [{wallet, nftCount, typeCounts?: {bonus, common,
+    // uncommon}}], bonuses: [{wallet, amount: BigInt}]. typeCounts is
+    // the per-type split behind nftCount; entries without it record
+    // zeros per type (their split was never read).
     recordNftDay(day, counts, bonuses) {
       if (q(`SELECT day FROM nft_days WHERE day = ?`, day)) return { skipped: true };
       try {
         db.exec('BEGIN');
         run(`INSERT INTO nft_days(day) VALUES(?)`, day);
-        for (const { wallet, nftCount } of counts) {
-          run(`INSERT INTO nft_snapshots(day, wallet, nft_count) VALUES(?, ?, ?)`,
-              day, wallet, nftCount);
+        for (const { wallet, nftCount, typeCounts } of counts) {
+          run(`INSERT INTO nft_snapshots(day, wallet, nft_count, count_bonus, count_common, count_uncommon)
+               VALUES(?, ?, ?, ?, ?, ?)`,
+              day, wallet, nftCount,
+              Math.max(0, Math.floor(Number(typeCounts?.bonus) || 0)),
+              Math.max(0, Math.floor(Number(typeCounts?.common) || 0)),
+              Math.max(0, Math.floor(Number(typeCounts?.uncommon) || 0)));
         }
         for (const { wallet, amount } of bonuses) {
           if (amount > 0n) {
@@ -465,6 +511,19 @@ export function openStore(path) {
       const r = q(`SELECT nft_count FROM nft_snapshots WHERE wallet = ?
                    ORDER BY day DESC LIMIT 1`, wallet);
       return r ? r.nft_count : 0;
+    },
+    // Per-type split of the wallet's latest NFT snapshot:
+    // { bonus, common, uncommon }. All zeros when the wallet has no
+    // snapshot, was excluded, or the snapshot predates type reads.
+    latestNftTypeCounts(wallet) {
+      const r = q(`SELECT count_bonus, count_common, count_uncommon
+                   FROM nft_snapshots WHERE wallet = ?
+                   ORDER BY day DESC LIMIT 1`, wallet);
+      return {
+        bonus: r ? r.count_bonus : 0,
+        common: r ? r.count_common : 0,
+        uncommon: r ? r.count_uncommon : 0,
+      };
     },
     lastNftSnapshotDay(wallet) {
       const r = q(`SELECT day FROM nft_snapshots WHERE wallet = ?

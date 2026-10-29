@@ -19,10 +19,24 @@
 //   — the server never invents funding).
 // - No other bonuses exist: no PvP steal, no grid bonuses, no top-10
 //   airdrops. Only this mechanic.
-// - Bonus formula (admin-set, never hardcoded): a flat FRG amount per
-//   NFT per snapshot day. Daily bonus = nftCount * bonusPerNft.
+// - Bonus formula (admin-set per type, never hardcoded): each NFT is
+//   classified by TYPE from its on-chain metadata (see
+//   classifyNftType) and earns that type's FRG rate per snapshot day.
+//   Types: bonus (the default — no rarity), common, uncommon. The
+//   rates MIRROR the old FRG app's (user-decided 2026-10-28/29):
+//   Bonus 4, Common 50, Uncommon 100 FRG/day ship as the settings
+//   defaults; the admin can change any of them at any time.
+//   Daily bonus = bonusCount*rateBonus + commonCount*rateCommon
+//               + uncommonCount*rateUncommon.
 // ─────────────────────────────────────────────────────────────
-import { isValidTerraAddress, parseWholeToBase } from './engine.js';
+import { isValidTerraAddress, isValidTerraContractAddress, parseWholeToBase } from './engine.js';
+
+// A collection setting names a CONTRACT (64 chars on Terra
+// Classic). The historical 44-char shape is also accepted so
+// existing stored values and tests keep validating; wallet-shaped
+// settings (excluded wallets, bonus pool wallet) do NOT use this —
+// they stay on the strict wallet check.
+const isCollectionAddress = (v) => isValidTerraAddress(v) || isValidTerraContractAddress(v);
 
 // Consolidate one holder's NFTs into a single calculation.
 // nftCount: non-negative integer (tokens owned at snapshot time).
@@ -45,13 +59,87 @@ export function consolidateNftPower(nftCount, threshold) {
   };
 }
 
-// Daily NFT bonus for one holder: flat rate per NFT per day, BigInt
-// base units (uFRG). Zero NFTs or zero rate pays zero.
-export function computeNftDailyBonus(nftCount, bonusPerNftBase) {
-  const count = BigInt(Math.max(0, Math.floor(Number(nftCount) || 0)));
-  const rate = BigInt(bonusPerNftBase || 0n);
-  if (count <= 0n || rate <= 0n) return 0n;
-  return count * rate;
+// ── NFT types ────────────────────────────────────────────────
+// Every NFT belongs to exactly one bonus type. Classification reads
+// the token's nft_info result (the object the LCD smart query
+// returns under `data`), defensively, in this order:
+// 1. a "Rarity" attribute in extension.attributes (the FRG REWARDS
+//    collection carries trait_type "Rarity" with value "Common" /
+//    "Uncommon" — verified on-chain 2026-10-29);
+// 2. a type word in the token name ("Uncommon" is checked before
+//    "Common" because it contains it);
+// 3. the DEFAULT type, "bonus" — e.g. the FRG REWARDS giveaway
+//    tokens, whose name is literally "Bonus" and whose attributes
+//    list is empty. An unreadable or empty extension also lands
+//    here, never in a higher-paying type.
+export const NFT_TYPES = ['bonus', 'common', 'uncommon'];
+export const DEFAULT_NFT_TYPE = 'bonus';
+
+function matchTypeName(v) {
+  const s = String(v ?? '').trim().toLowerCase();
+  if (!s) return null;
+  if (s.includes('uncommon')) return 'uncommon';
+  if (s.includes('common')) return 'common';
+  if (s.includes('bonus')) return 'bonus';
+  return null;
+}
+
+export function classifyNftType(info) {
+  if (!info || typeof info !== 'object') return DEFAULT_NFT_TYPE;
+  const ext = info.extension && typeof info.extension === 'object' ? info.extension : info;
+  const attrs = Array.isArray(ext.attributes) ? ext.attributes : [];
+  for (const a of attrs) {
+    if (String(a?.trait_type ?? '').trim().toLowerCase() === 'rarity') {
+      const t = matchTypeName(a?.value);
+      if (t) return t;
+    }
+  }
+  return matchTypeName(ext.name) || DEFAULT_NFT_TYPE;
+}
+
+// A zeroed per-type count bag: { bonus, common, uncommon, total }.
+export function emptyTypeCounts() {
+  return { bonus: 0, common: 0, uncommon: 0, total: 0 };
+}
+
+// Normalize anything count-shaped into a full type-count bag.
+// A plain number is the pre-type contract (an older caller that only
+// counted tokens): every token lands in the DEFAULT type, which is
+// what those callers' flat rate priced anyway. Objects may carry
+// any subset of the per-type fields; `total` is recomputed from the
+// parts unless the parts are all absent and a total was supplied.
+export function normalizeTypeCounts(x) {
+  if (typeof x === 'number' || typeof x === 'bigint') {
+    const n = Math.max(0, Math.floor(Number(x) || 0));
+    return { bonus: n, common: 0, uncommon: 0, total: n };
+  }
+  const out = emptyTypeCounts();
+  if (x && typeof x === 'object') {
+    let parts = 0;
+    for (const t of NFT_TYPES) {
+      out[t] = Math.max(0, Math.floor(Number(x[t]) || 0));
+      parts += out[t];
+    }
+    out.total = parts > 0 || x.total == null
+      ? parts
+      : Math.max(0, Math.floor(Number(x.total) || 0));
+    if (parts === 0 && out.total > 0) out[DEFAULT_NFT_TYPE] = out.total;
+  }
+  return out;
+}
+
+// Daily NFT bonus for one holder under per-type rates: the sum of
+// count(type) x rate(type), BigInt base units (uFRG). A type with
+// zero count or zero rate contributes zero.
+export function computeNftDailyBonusByType(typeCounts, rates) {
+  const counts = normalizeTypeCounts(typeCounts);
+  let total = 0n;
+  for (const t of NFT_TYPES) {
+    const c = BigInt(counts[t]);
+    const r = BigInt(rates?.[t] || 0n);
+    if (c > 0n && r > 0n) total += c * r;
+  }
+  return total;
 }
 
 // Validate an admin NFT-settings update. Only fields PRESENT in the
@@ -69,8 +157,11 @@ export function computeNftDailyBonus(nftCount, bonusPerNftBase) {
 //   (e.g. the owner's own bonus-stock wallet). Same list rules as
 //   `collections`: array of valid Terra addresses, duplicates
 //   dropped, empty array clears the list.
-// - mintCostWhole / bonusPerNftWhole: whole-FRG decimal strings,
-//   must parse and be >= 0.
+// - mintCostWhole: whole-FRG decimal string, must parse and be >= 0.
+// - bonusRateBonusWhole / bonusRateCommonWhole /
+//   bonusRateUncommonWhole: the per-type daily bonus rates as
+//   whole-FRG decimal strings, each parsed and >= 0, each settable
+//   independently of the others.
 // - threshold / supplyCap: non-negative integers (0 = unset / unlimited).
 // - bonusPoolWallet: '' clears it; otherwise a valid Terra address.
 export function validateNftSettings(input) {
@@ -78,7 +169,7 @@ export function validateNftSettings(input) {
   if (input == null || typeof input !== 'object') throw new Error('invalid settings');
   if ('collection' in input) {
     const v = String(input.collection ?? '').trim();
-    if (v !== '' && !isValidTerraAddress(v)) throw new Error('invalid NFT collection address');
+    if (v !== '' && !isCollectionAddress(v)) throw new Error('invalid NFT collection address');
     updates.collection = v;
   }
   if ('collections' in input) {
@@ -87,7 +178,7 @@ export function validateNftSettings(input) {
     const list = [];
     for (const raw of input.collections) {
       const v = String(raw ?? '').trim();
-      if (!isValidTerraAddress(v)) throw new Error('invalid NFT collection address in collections list');
+      if (!isCollectionAddress(v)) throw new Error('invalid NFT collection address in collections list');
       if (!seen.has(v)) { seen.add(v); list.push(v); }
     }
     updates.collections = list;
@@ -106,8 +197,14 @@ export function validateNftSettings(input) {
   if ('mintCostWhole' in input) {
     updates.mintCost = parseAmount(input.mintCostWhole, 'invalid mint cost');
   }
-  if ('bonusPerNftWhole' in input) {
-    updates.bonusPerNft = parseAmount(input.bonusPerNftWhole, 'invalid bonus per NFT');
+  if ('bonusRateBonusWhole' in input) {
+    updates.bonusRateBonus = parseAmount(input.bonusRateBonusWhole, 'invalid Bonus NFT rate');
+  }
+  if ('bonusRateCommonWhole' in input) {
+    updates.bonusRateCommon = parseAmount(input.bonusRateCommonWhole, 'invalid Common NFT rate');
+  }
+  if ('bonusRateUncommonWhole' in input) {
+    updates.bonusRateUncommon = parseAmount(input.bonusRateUncommonWhole, 'invalid Uncommon NFT rate');
   }
   if ('threshold' in input) {
     updates.threshold = parseCount(input.threshold, 'invalid fully-powered threshold');

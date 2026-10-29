@@ -32,6 +32,16 @@ export function isValidTerraAddress(addr) {
     [...addr.slice(6)].every((ch) => BECH32.includes(ch));
 }
 
+// Contract addresses are a different shape from wallet addresses:
+// 64 chars (a 32-byte contract address bech32-encoded). Collection
+// settings must accept THESE — the 44-char wallet check above
+// rejects every real CW721/CW20 contract, including FRG REWARDS.
+// Wallet-shaped fields keep using isValidTerraAddress alone.
+export function isValidTerraContractAddress(addr) {
+  return typeof addr === 'string' && addr.length === 64 && addr.startsWith('terra1') &&
+    [...addr.slice(6)].every((ch) => BECH32.includes(ch));
+}
+
 // Whole-token decimal string ("1234.5") -> 6-decimal base units.
 // Used for both FRG wallet balances and USTC reward amounts; the two
 // assets share the same decimal scale but are never interchanged.
