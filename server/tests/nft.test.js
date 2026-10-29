@@ -7,7 +7,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import {
-  consolidateNftPower, computeNftDailyBonus,
+  consolidateNftPower, computeNftDailyBonusByType,
   validateNftSettings, validateFundingAmount,
   verifyMintTransfer, isValidTxhash,
 } from '../src/nft.js';
@@ -64,24 +64,32 @@ test('battery: unset threshold (0) never claims fully powered', () => {
   assert.equal(p.fullyPowered, false);
 });
 
-// --- Daily bonus math ---
+// --- Daily bonus math (per-type rates) ---
 
-test('daily NFT bonus: count x per-NFT rate, zero cases pay zero', () => {
-  assert.equal(computeNftDailyBonus(3, 5000000n), 15000000n);
-  assert.equal(computeNftDailyBonus(0, 5000000n), 0n);
-  assert.equal(computeNftDailyBonus(3, 0n), 0n);
+test('daily NFT bonus: sum of count(type) x rate(type), zero cases pay zero', () => {
+  const rates = { bonus: 4000000n, common: 50000000n, uncommon: 100000000n };
+  assert.equal(computeNftDailyBonusByType({ bonus: 3, common: 0, uncommon: 0 }, rates), 12000000n);
+  assert.equal(computeNftDailyBonusByType({ bonus: 1, common: 1, uncommon: 1 }, rates), 154000000n);
+  assert.equal(computeNftDailyBonusByType({ bonus: 0, common: 0, uncommon: 0 }, rates), 0n);
+  assert.equal(computeNftDailyBonusByType({ bonus: 3, common: 2, uncommon: 1 },
+    { bonus: 0n, common: 0n, uncommon: 0n }), 0n);
+  // A plain number is the pre-type contract: all default (Bonus) type.
+  assert.equal(computeNftDailyBonusByType(3, rates), 12000000n);
 });
 
 // --- Admin-number validation ---
 
 test('admin NFT settings: valid update normalizes', () => {
   const u = validateNftSettings({
-    collection: COLLECTION, mintCostWhole: '1000', bonusPerNftWhole: '5',
+    collection: COLLECTION, mintCostWhole: '1000',
+    bonusRateBonusWhole: '4', bonusRateCommonWhole: '50', bonusRateUncommonWhole: '100',
     threshold: 10, supplyCap: 0, bonusPoolWallet: POOL_WALLET,
   });
   assert.equal(u.collection, COLLECTION);
   assert.equal(u.mintCost, 1000000000n);
-  assert.equal(u.bonusPerNft, 5000000n);
+  assert.equal(u.bonusRateBonus, 4000000n);
+  assert.equal(u.bonusRateCommon, 50000000n);
+  assert.equal(u.bonusRateUncommon, 100000000n);
   assert.equal(u.threshold, 10);
   assert.equal(u.supplyCap, 0);
   assert.equal(u.bonusPoolWallet, POOL_WALLET);
@@ -96,7 +104,9 @@ test('admin NFT settings: invalid values are rejected', () => {
   assert.throws(() => validateNftSettings({ collection: 'cosmos1' + 'a'.repeat(38) }), /invalid NFT collection/);
   assert.throws(() => validateNftSettings({ mintCostWhole: '-5' }), /invalid mint cost/);
   assert.throws(() => validateNftSettings({ mintCostWhole: 'abc' }), /invalid mint cost/);
-  assert.throws(() => validateNftSettings({ bonusPerNftWhole: '1.1234567' }), /invalid bonus per NFT/);
+  assert.throws(() => validateNftSettings({ bonusRateBonusWhole: '1.1234567' }), /invalid Bonus NFT rate/);
+  assert.throws(() => validateNftSettings({ bonusRateCommonWhole: '-1' }), /invalid Common NFT rate/);
+  assert.throws(() => validateNftSettings({ bonusRateUncommonWhole: 'abc' }), /invalid Uncommon NFT rate/);
   assert.throws(() => validateNftSettings({ threshold: -1 }), /invalid fully-powered threshold/);
   assert.throws(() => validateNftSettings({ threshold: 2.5 }), /invalid fully-powered threshold/);
   assert.throws(() => validateNftSettings({ threshold: 'abc' }), /invalid fully-powered threshold/);
@@ -205,7 +215,7 @@ async function seededNft() {
   store.registerWallet(A, null);
   store.setDailyPool(1_000_000n);
   store.setNftSettings({
-    collection: COLLECTION, mintCost: 1000000000n, bonusPerNft: 5000000n,
+    collection: COLLECTION, mintCost: 1000000000n, bonusRateBonus: 5000000n,
     threshold: 10, supplyCap: 0, bonusPoolWallet: POOL_WALLET,
   });
   store.fundBonusPool(100_000_000n, 'test funding');
@@ -259,7 +269,7 @@ test('NFT bonus collect: empty bonus pool fails safely, bonus stays collectable'
   const { store, base } = ctx;
   store.registerWallet(A, null);
   store.setNftSettings({
-    collection: COLLECTION, mintCost: 1000000000n, bonusPerNft: 5000000n,
+    collection: COLLECTION, mintCost: 1000000000n, bonusRateBonus: 5000000n,
     threshold: 10, supplyCap: 0, bonusPoolWallet: POOL_WALLET,
   });
   // No funding: pool available is 0, bonus accrued is 15,000,000.
@@ -277,7 +287,7 @@ test('NFT bonus collect: blocked when bonus pool wallet unset', async (t) => {
   t.after(() => { ctx.server.closeAllConnections(); ctx.server.close(); });
   const { store, base } = ctx;
   store.registerWallet(A, null);
-  store.setNftSettings({ collection: COLLECTION, bonusPerNft: 5000000n });
+  store.setNftSettings({ collection: COLLECTION, bonusRateBonus: 5000000n });
   await runSnapshot(store, async () => 1_000_000n, '2026-10-24', async () => 2);
   const c = await post(base, '/api/nft/collect', { address: A });
   assert.equal(c.status, 503);
@@ -308,7 +318,7 @@ test('admin NFT settings: valid saves, invalid rejected with 400', async (t) => 
     { mintCostWhole: '100' }, { 'x-admin-wallet': ADMIN, 'x-admin-secret': 'nope' });
   assert.equal(noAuth.status, 403);
   const ok = await post(base, '/api/admin/nft/settings',
-    { collection: COLLECTION, mintCostWhole: '1000', bonusPerNftWhole: '5', threshold: 10 },
+    { collection: COLLECTION, mintCostWhole: '1000', bonusRateBonusWhole: '5', threshold: 10 },
     adminHeaders);
   assert.equal(ok.status, 200);
   assert.equal(ok.body.mintCost, '1000000000');

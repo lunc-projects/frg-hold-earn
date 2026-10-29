@@ -10,7 +10,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { validateNftSettings } from '../src/nft.js';
-import { cw721CountMulti } from '../src/nftChain.js';
+import { cw721CountMulti, cw721TypeCountsMulti } from '../src/nftChain.js';
 import { openStore } from '../src/store.js';
 import { createApp, runSnapshot } from '../src/server.js';
 
@@ -37,6 +37,10 @@ function stubLcdFetch({ fail = false } = {}) {
     assert.ok(m, `unexpected fetch url: ${url}`);
     const [, collection, b64q] = m;
     const query = JSON.parse(Buffer.from(b64q, 'base64').toString('utf8'));
+    if (query.nft_info) {
+      // Fixture tokens are all default-type ("Bonus", no rarity).
+      return { ok: true, status: 200, json: async () => ({ data: { token_uri: null, extension: { name: 'Bonus', attributes: [] } } }) };
+    }
     const { owner, limit = 30, start_after } = query.tokens;
     const all = (HOLDINGS[collection] && HOLDINGS[collection][owner]) || [];
     let from = 0;
@@ -87,13 +91,13 @@ test('snapshot: excluded holder records 0, accrues 0, is never chain-read; base 
     store.setDailyPool(1_000_000n);
     store.setNftSettings({
       collections: [COL1, COL2],
-      bonusPerNft: 2_000_000n, // 2 FRG per NFT/day
+      bonusRateBonus: 2_000_000n, // 2 FRG per NFT/day
       excludedWallets: [A],
     });
     const readFor = [];
     const fetchNftCount = (addr) => {
       readFor.push(addr);
-      return cw721CountMulti(LCD, store.getNftCollections(), addr);
+      return cw721TypeCountsMulti(LCD, store.getNftCollections(), addr);
     };
     const out = await runSnapshot(store, async () => 1_000_000n, '2026-10-28', fetchNftCount);
     assert.equal(out.nft.skipped, false);
@@ -120,12 +124,12 @@ test('snapshot: empty exclusion list keeps legacy behavior (every wallet read + 
     const store = tempStore();
     store.registerWallet(A, null);
     store.setDailyPool(0n);
-    store.setNftSettings({ collections: [COL1, COL2], bonusPerNft: 2_000_000n });
+    store.setNftSettings({ collections: [COL1, COL2], bonusRateBonus: 2_000_000n });
     // No excludedWallets set — default empty list.
     const readFor = [];
     const fetchNftCount = (addr) => {
       readFor.push(addr);
-      return cw721CountMulti(LCD, store.getNftCollections(), addr);
+      return cw721TypeCountsMulti(LCD, store.getNftCollections(), addr);
     };
     await runSnapshot(store, async () => 1_000_000n, '2026-10-28', fetchNftCount);
     assert.deepEqual(readFor, [A]);
@@ -141,8 +145,8 @@ test('snapshot: LCD failure still skips the whole NFT day when an exclusion is s
   store.registerWallet(A, null);
   store.registerWallet(B, null);
   store.setDailyPool(1_000_000n);
-  store.setNftSettings({ collections: [COL1, COL2], bonusPerNft: 2_000_000n, excludedWallets: [A] });
-  const fetchNftCount = (addr) => cw721CountMulti(LCD, store.getNftCollections(), addr);
+  store.setNftSettings({ collections: [COL1, COL2], bonusRateBonus: 2_000_000n, excludedWallets: [A] });
+  const fetchNftCount = (addr) => cw721TypeCountsMulti(LCD, store.getNftCollections(), addr);
 
   const realFetch = global.fetch;
   global.fetch = stubLcdFetch({ fail: true });

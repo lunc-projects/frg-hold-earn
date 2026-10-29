@@ -9,7 +9,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { validateNftSettings } from '../src/nft.js';
-import { cw721CountMulti } from '../src/nftChain.js';
+import { cw721CountMulti, cw721TypeCountsMulti } from '../src/nftChain.js';
 import { openStore } from '../src/store.js';
 import { createApp, runSnapshot } from '../src/server.js';
 
@@ -29,8 +29,11 @@ const HOLDINGS = {
   [COL2]: { [A]: ['c2-1', 'c2-2', 'c2-3'], [B]: ['c2-8', 'c2-9'] },
 };
 
-// Stub global fetch serving ONLY the cw721 `tokens` smart query,
-// with start_after/limit paging, from HOLDINGS. fail=true -> HTTP 500.
+// Stub global fetch serving the cw721 `tokens` smart query (with
+// start_after/limit paging, from HOLDINGS) and `nft_info` queries —
+// every fixture token reports the default-type metadata (name
+// "Bonus", no rarity attribute), so consolidated per-type counts
+// land entirely in the bonus bucket. fail=true -> HTTP 500.
 function stubLcdFetch({ fail = false } = {}) {
   let calls = 0;
   const fn = async (url) => {
@@ -40,6 +43,9 @@ function stubLcdFetch({ fail = false } = {}) {
     assert.ok(m, `unexpected fetch url: ${url}`);
     const [, collection, b64q] = m;
     const query = JSON.parse(Buffer.from(b64q, 'base64').toString('utf8'));
+    if (query.nft_info) {
+      return { ok: true, status: 200, json: async () => ({ data: { token_uri: null, extension: { name: 'Bonus', attributes: [] } } }) };
+    }
     const { owner, limit = 30, start_after } = query.tokens;
     const all = (HOLDINGS[collection] && HOLDINGS[collection][owner]) || [];
     let from = 0;
@@ -122,8 +128,8 @@ test('snapshot: holdings in 2 collections consolidate; bonus = count x rate exac
     store.registerWallet(A, null);
     store.registerWallet(B, null);
     store.setDailyPool(1_000_000n); // 1 USTC base-unit pool for the base side
-    store.setNftSettings({ collections: [COL1, COL2], bonusPerNft: 2_000_000n }); // 2 FRG per NFT/day
-    const fetchNftCount = (addr) => cw721CountMulti(LCD, store.getNftCollections(), addr);
+    store.setNftSettings({ collections: [COL1, COL2], bonusRateBonus: 2_000_000n }); // 2 FRG per NFT/day
+    const fetchNftCount = (addr) => cw721TypeCountsMulti(LCD, store.getNftCollections(), addr);
     const out = await runSnapshot(store, async () => 1_000_000n, '2026-10-28', fetchNftCount);
     assert.equal(out.nft.skipped, false);
     // Consolidated counts persisted with the snapshot.
@@ -147,8 +153,8 @@ test('snapshot: holder with no NFTs counts 0 and accrues no bonus', async () => 
     const store = tempStore();
     store.registerWallet(B, null);
     store.setDailyPool(0n);
-    store.setNftSettings({ collections: [COL1], bonusPerNft: 2_000_000n });
-    const fetchNftCount = (addr) => cw721CountMulti(LCD, store.getNftCollections(), addr);
+    store.setNftSettings({ collections: [COL1], bonusRateBonus: 2_000_000n });
+    const fetchNftCount = (addr) => cw721TypeCountsMulti(LCD, store.getNftCollections(), addr);
     await runSnapshot(store, async () => 5_000_000n, '2026-10-28', fetchNftCount);
     assert.equal(store.latestNftCount(B), 0); // B holds nothing in COL1
     assert.equal(store.nftAccrued(B), 0n);
@@ -162,8 +168,8 @@ test('snapshot: LCD failure skips the NFT day, base completes, retry lands the N
   const store = tempStore();
   store.registerWallet(A, null);
   store.setDailyPool(1_000_000n);
-  store.setNftSettings({ collections: [COL1, COL2], bonusPerNft: 2_000_000n });
-  const fetchNftCount = (addr) => cw721CountMulti(LCD, store.getNftCollections(), addr);
+  store.setNftSettings({ collections: [COL1, COL2], bonusRateBonus: 2_000_000n });
+  const fetchNftCount = (addr) => cw721TypeCountsMulti(LCD, store.getNftCollections(), addr);
 
   const realFetch = global.fetch;
   global.fetch = stubLcdFetch({ fail: true });
@@ -230,12 +236,18 @@ test('rate unset: counts snapshot, zero bonus accrues, views say "not set yet"',
   const store = tempStore();
   store.registerWallet(A, null);
   store.setDailyPool(0n);
-  store.setNftSettings({ collections: [COL1, COL2] }); // bonusPerNft stays 0 = unset
-  const fetchNftCount = (addr) => cw721CountMulti(LCD, store.getNftCollections(), addr);
+  // The unset state under per-type rates: all three rates at 0.
+  // (A fresh store ships the decided 4/50/100 defaults instead.)
+  store.setNftSettings({
+    collections: [COL1, COL2],
+    bonusRateBonus: 0n, bonusRateCommon: 0n, bonusRateUncommon: 0n,
+  });
+  const fetchNftCount = (addr) => cw721TypeCountsMulti(LCD, store.getNftCollections(), addr);
   await runSnapshot(store, async () => 1_000_000n, '2026-10-28', fetchNftCount);
   global.fetch = realFetch;
 
   assert.equal(store.latestNftCount(A), 35); // holdings still counted
+  assert.deepEqual(store.latestNftTypeCounts(A), { bonus: 35, common: 0, uncommon: 0 });
   assert.equal(store.nftAccrued(A), 0n); // but no bonus figure accrues
 
   const { server, base } = await startApp(store);
@@ -244,8 +256,9 @@ test('rate unset: counts snapshot, zero bonus accrues, views say "not set yet"',
   assert.equal(view.body.configured, true);
   assert.deepEqual(view.body.collections, [COL1, COL2]);
   assert.equal(view.body.bonusRateSet, false);
-  assert.match(view.body.bonusNotice, /bonus rate is not set yet/);
+  assert.match(view.body.bonusNotice, /bonus rates are not set yet/);
   assert.equal(view.body.nftCount, 35);
+  assert.deepEqual(view.body.nftTypeCounts, { bonus: 35, common: 0, uncommon: 0 });
   assert.equal(view.body.claimable, '0');
   const stats = await get(base, '/api/stats');
   assert.equal(stats.body.nft.bonusCollectionsConfigured, true);
@@ -260,7 +273,10 @@ test('admin HTTP: set/get bonus collections; invalid entry rejected with 400', a
     { collections: [COL1, COL2] }, adminHeaders);
   assert.equal(ok.status, 200);
   assert.deepEqual(ok.body.collections, [COL1, COL2]);
-  assert.equal(ok.body.bonusRateSet, false);
+  // A fresh store ships the decided per-type rates (4/50/100), so
+  // the rates read as set with their defaults in the response.
+  assert.equal(ok.body.bonusRateSet, true);
+  assert.deepEqual(ok.body.bonusRatesWhole, { bonus: '4', common: '50', uncommon: '100' });
   const bad = await post(base, '/api/admin/nft/settings',
     { collections: [COL1, 'bogus'] }, adminHeaders);
   assert.equal(bad.status, 400);
