@@ -127,7 +127,9 @@ test('snapshot: holdings in 2 collections consolidate; bonus = count x rate exac
     const store = tempStore();
     store.registerWallet(A, null);
     store.registerWallet(B, null);
-    store.setDailyPool(1_000_000n); // 1 USTC base-unit pool for the base side
+    store.setDailyPool(1_000_000n); // the day's pot
+    store.registerForDay('2026-10-28', A); // both wallets are in the day's round
+    store.registerForDay('2026-10-28', B);
     store.setNftSettings({ collections: [COL1, COL2], bonusRateBonus: 2_000_000n }); // 2 FRG per NFT/day
     const fetchNftCount = (addr) => cw721TypeCountsMulti(LCD, store.getNftCollections(), addr);
     const out = await runSnapshot(store, async () => 1_000_000n, '2026-10-28', fetchNftCount);
@@ -139,7 +141,8 @@ test('snapshot: holdings in 2 collections consolidate; bonus = count x rate exac
     //                 B:  2 NFTs x 2 FRG =  4 FRG =  4,000,000 base.
     assert.equal(store.nftAccrued(A), 70_000_000n);
     assert.equal(store.nftAccrued(B), 4_000_000n);
-    // Base side ran normally alongside (equal FRG weights split the pool).
+    // Base side ran normally alongside (equal balances earn equally;
+    // the day's pot splits evenly between the two equal holders).
     assert.deepEqual(store.snapshotDays(), ['2026-10-28']);
     assert.equal(store.accrued(A), 500_000n);
     assert.equal(store.accrued(B), 500_000n);
@@ -167,7 +170,8 @@ test('snapshot: holder with no NFTs counts 0 and accrues no bonus', async () => 
 test('snapshot: LCD failure skips the NFT day, base completes, retry lands the NFT day', async () => {
   const store = tempStore();
   store.registerWallet(A, null);
-  store.setDailyPool(1_000_000n);
+  store.setDailyPool(1_000_000n); // the day's pot
+    store.registerForDay('2026-10-28', A); // A is in the day's round
   store.setNftSettings({ collections: [COL1, COL2], bonusRateBonus: 2_000_000n });
   const fetchNftCount = (addr) => cw721TypeCountsMulti(LCD, store.getNftCollections(), addr);
 

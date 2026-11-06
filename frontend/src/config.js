@@ -2,8 +2,9 @@
 // FRG Hold & Earn — frontend config.
 // Core hold-and-earn: NO contracts, NO staking, NO locking — holders
 // keep FRG in their own wallets; this app only READS FRG balances and
-// talks to the backend, which pays USTC rewards from USTC the owner
-// deposits into the payout wallet.
+// talks to the backend, which pays base rewards in the LIVE reward
+// asset reported by the API (FRG since 2026-11-05). The page renders
+// the API's reward symbol — no currency is hard-coded in the copy.
 // Separate opt-in NFT bonus section: only active once the admin
 // configures a real CW721 collection address; until then the NFT
 // section honestly reports zero holdings and minting not open.
@@ -16,7 +17,8 @@ export const RPC_URL = 'https://terra-classic-rpc.publicnode.com';
 export const FINDER = 'https://finder.terraclassic.community/mainnet';
 
 // FRG — "FRG Universe" CW20, decimals 6 (verified on-chain). This is
-// the HELD token: balances are the pro-rata weights for rewards.
+// the HELD token (snapshot balances drive earnings) AND, since
+// 2026-11-05, the base REWARD token as well.
 export const FRG = {
   symbol: 'FRG',
   name: 'FRG Universe',
@@ -24,9 +26,11 @@ export const FRG = {
   decimals: 6,
 };
 
-// USTC — the BASE REWARD token. Native Terra Classic denom "uusd",
-// decimals 6. Holders earn USTC; the separate NFT bonus section still
-// denominates in FRG and does not use this constant.
+// USTC — DORMANT future reward option (native Terra Classic denom
+// "uusd", decimals 6). NOT the current reward: kept because paying
+// USTC from validator commission is the planned delegation driver.
+// The backend's reward-asset descriptor is the operative switch;
+// this constant is retained for that future use only.
 export const USTC = {
   symbol: 'USTC',
   name: 'TerraUSD',

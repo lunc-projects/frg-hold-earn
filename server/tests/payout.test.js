@@ -4,6 +4,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createPayout, bankBalance, USTC_DENOM } from '../src/payout.js';
+import { FRG_TOKEN, REWARD_ASSETS } from '../src/assets.js';
 
 const TEST_MNEMONIC = 'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about';
 const ENV_ADDR = 'terra1' + 'q'.repeat(38);
@@ -80,17 +81,43 @@ test('bankBalance reads a missing denom balance as zero', async () => {
   }
 });
 
-test('address-only config: USTC balance readable, USTC sending refuses without a key', async () => {
+test('USTC descriptor selected (dormant option): reward balance reads the bank, USTC sending refuses without a key', async () => {
   const realFetch = global.fetch;
   global.fetch = async () => ({ ok: true, json: async () => ({ balance: { denom: 'uusd', amount: '42' } }) });
   try {
-    const p = createPayout({ lcdUrl: 'http://lcd.example', rpcUrl: '', payoutAddress: ENV_ADDR, mnemonic: '' });
+    const p = createPayout({ lcdUrl: 'http://lcd.example', rpcUrl: '', payoutAddress: ENV_ADDR, mnemonic: '', rewardAsset: 'USTC' });
+    assert.equal(p.rewardAsset, REWARD_ASSETS.USTC);
     assert.equal(await p.getUstcBalance(), 42n);
-    assert.equal(await p.getRewardBalance(), 42n);
+    assert.equal(await p.getRewardBalance(), 42n); // dispatched to the native path
     await assert.rejects(() => p.sendUstc(ENV_ADDR, 1n), /payout wallet not configured yet/);
+    await assert.rejects(() => p.sendReward(ENV_ADDR, 1n), /payout wallet not configured yet/);
   } finally {
     global.fetch = realFetch;
   }
+});
+
+test('default reward asset is FRG: reward balance is a CW20 query on the FRG contract', async () => {
+  const realFetch = global.fetch;
+  let seenUrl = '';
+  global.fetch = async (url) => {
+    seenUrl = String(url);
+    return { ok: true, json: async () => ({ data: { balance: '777' } }) };
+  };
+  try {
+    const p = createPayout({ lcdUrl: 'http://lcd.example', rpcUrl: '', payoutAddress: ENV_ADDR, mnemonic: '' });
+    assert.equal(p.rewardAsset, REWARD_ASSETS.FRG); // live default
+    assert.equal(await p.getRewardBalance(), 777n);
+    assert.match(seenUrl, new RegExp(`/cosmwasm/wasm/v1/contract/${FRG_TOKEN}/smart/`));
+    // sendReward refuses safely without a key (no chain call made).
+    await assert.rejects(() => p.sendReward(ENV_ADDR, 1n), /payout wallet not configured yet/);
+  } finally {
+    global.fetch = realFetch;
+  }
+});
+
+test('sendReward with a mismatched key refuses before any chain call (FRG path)', async () => {
+  const p = createPayout({ lcdUrl: 'http://127.0.0.1:1', rpcUrl: '', payoutAddress: ENV_ADDR, mnemonic: TEST_MNEMONIC });
+  await assert.rejects(() => p.sendReward(ENV_ADDR, 1n), /misconfigured: key does not match payout address/);
 });
 
 test('address/key mismatch refuses USTC sends before any chain call', async () => {

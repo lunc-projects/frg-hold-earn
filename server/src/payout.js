@@ -1,10 +1,14 @@
 // ─────────────────────────────────────────────────────────────
 // FRG Hold & Earn — payout wallet (the ONLY wallet that ever sends).
-// Holders' FRG never moves. BASE rewards are native USTC bank sends
-// FROM this wallet TO the holder (denom "uusd"); the owner funds the
-// wallet with USTC deposits plus a little LUNC for gas. The older FRG
-// CW20 send path below is retained ONLY for the separate NFT bonus
-// mechanic, whose currency and logic were not converted.
+// Holders' FRG never moves. BASE rewards pay in the LIVE reward
+// asset (assets.js): FRG via the CW20 transfer path since
+// 2026-11-05 (owner ruling: holders earn FRG). The USTC native
+// bank-send path is retained INTACT as the dormant future option
+// (USTC-from-commission is the planned delegation driver) —
+// getRewardBalance/sendReward dispatch on the configured reward
+// asset descriptor; selecting the USTC descriptor later revives
+// that path without touching this logic. The NFT bonus mechanic
+// has always been FRG and uses sendFrg via `send` below.
 //
 // Key handling (non-negotiable):
 // - The payout ADDRESS is env var FRG_PAYOUT_ADDRESS (configured
@@ -31,6 +35,9 @@ import { DirectSecp256k1HdWallet } from '@cosmjs/proto-signing';
 import { stringToPath } from '@cosmjs/crypto';
 import { SigningCosmWasmClient } from '@cosmjs/cosmwasm-stargate';
 import { SigningStargateClient, GasPrice } from '@cosmjs/stargate';
+import { FRG_TOKEN, REWARD_ASSETS, rewardAssetFor } from './assets.js';
+
+export { FRG_TOKEN };
 
 // Terra HD derivation path (coin type 330). Terra wallets (Terra
 // Station, Keplr, Leap, Galaxy Station) derive Terra addresses with
@@ -41,7 +48,6 @@ import { SigningStargateClient, GasPrice } from '@cosmjs/stargate';
 // correct payout-wallet key. Every derivation below uses 330.
 const TERRA_HD_PATHS = [stringToPath("m/44'/330'/0'/0/0")];
 
-export const FRG_TOKEN = 'terra14rfnhc2aru7jp304lht3yf903necsnrt4cxd464cftsfcksw0rtsgundnt';
 export const USTC_DENOM = 'uusd';
 
 const b64 = (obj) => Buffer.from(JSON.stringify(obj)).toString('base64');
@@ -65,10 +71,15 @@ export async function bankBalance(lcdUrl, address, denom = USTC_DENOM) {
   return BigInt(data.balance?.amount ?? '0');
 }
 
-export function createPayout({ lcdUrl, rpcUrl, payoutAddress, mnemonic }) {
+export function createPayout({ lcdUrl, rpcUrl, payoutAddress, mnemonic, rewardAsset }) {
   const envAddress = (payoutAddress || '').trim() || null;
   const hasKey = Boolean(mnemonic && mnemonic.trim());
   let derivedAddress = null;
+  // The LIVE reward asset for base rewards (descriptor object or
+  // symbol string). Defaults to FRG, the current live reward.
+  const asset = typeof rewardAsset === 'string'
+    ? rewardAssetFor(rewardAsset)
+    : (rewardAsset || REWARD_ASSETS.FRG);
 
   // The displayed payout address. Env var wins; otherwise the key's
   // own address; otherwise null. Needs NO key when the env var is set.
@@ -102,11 +113,12 @@ export function createPayout({ lcdUrl, rpcUrl, payoutAddress, mnemonic }) {
     return bankBalance(lcdUrl, addr, USTC_DENOM);
   }
 
-  // BASE reward send: `amount` base units of USTC (uusd) via a native
-  // bank send. The actual USTC balance is re-read from the SENDING
-  // wallet immediately before signing and hard-caps the payment.
-  // Throws on every failure mode; the caller voids the pending
-  // payment on throw.
+  // USTC send: `amount` base units of USTC (uusd) via a native bank
+  // send. The actual USTC balance is re-read from the SENDING wallet
+  // immediately before signing and hard-caps the payment. Throws on
+  // every failure mode; the caller voids the pending payment on
+  // throw. Retained for the dormant USTC reward option — the base
+  // Collect reaches it only when the USTC descriptor is selected.
   async function sendUstc(recipient, amount) {
     const { wallet, from } = await sendingWallet();
     const balance = await bankBalance(lcdUrl, from, USTC_DENOM);
@@ -122,9 +134,10 @@ export function createPayout({ lcdUrl, rpcUrl, payoutAddress, mnemonic }) {
     }
   }
 
-  // FRG CW20 send, retained ONLY for the separate NFT bonus mechanic
-  // (its currency was not converted). Base Collect must never call
-  // this — it calls sendUstc above.
+  // FRG CW20 send: used by the separate NFT bonus mechanic AND by
+  // base rewards while FRG is the live reward asset. The actual FRG
+  // balance is re-read from the SENDING wallet immediately before
+  // signing and hard-caps the payment.
   async function sendFrg(recipient, amount) {
     const { wallet, from } = await sendingWallet();
     const balance = await cw20Balance(lcdUrl, FRG_TOKEN, from);
@@ -140,27 +153,49 @@ export function createPayout({ lcdUrl, rpcUrl, payoutAddress, mnemonic }) {
     }
   }
 
+  // Base-reward balance/send, dispatched on the live reward asset:
+  // CW20 (FRG today) reads/sends through the contract path; native
+  // (USTC, dormant) through the bank path. This is the ONLY pair the
+  // base Collect is allowed to use.
+  async function rewardBalance() {
+    const addr = await address();
+    if (!addr) throw new Error('payout wallet not configured yet');
+    return asset.kind === 'cw20'
+      ? cw20Balance(lcdUrl, asset.token, addr)
+      : bankBalance(lcdUrl, addr, asset.denom);
+  }
+  async function sendReward(recipient, amount) {
+    return asset.kind === 'cw20' ? sendFrg(recipient, amount) : sendUstc(recipient, amount);
+  }
+
   return {
     // True only when sending is possible (a key is present).
     get configured() { return hasKey; },
     get canSend() { return hasKey; },
     address,
 
-    // FRG CW20 balance of the payout wallet. Retained for the admin
-    // FRG display and the NFT bonus path — NOT the base reward cap.
+    // The live reward asset descriptor this payout routes by.
+    rewardAsset: asset,
+
+    // FRG CW20 balance of the payout wallet (NFT bonus path and,
+    // while FRG is the reward, the base reward balance too).
     async getBalance() {
       const addr = await address();
       if (!addr) throw new Error('payout wallet not configured yet');
       return cw20Balance(lcdUrl, FRG_TOKEN, addr);
     },
 
-    // USTC balance of the payout wallet: the base reward cap and the
-    // balance the owner's deposits land in.
+    // USTC balance of the payout wallet (dormant future option's
+    // funding view; base Collect caps against it only when the
+    // USTC descriptor is selected).
     getUstcBalance: ustcBalance,
-    getRewardBalance: ustcBalance,
+
+    // Base reward routing (descriptor-dispatched — see above).
+    getRewardBalance: rewardBalance,
+    sendReward,
 
     send: sendFrg,
     sendUstc,
-    sendReward: sendUstc,
+    sendFrg,
   };
 }

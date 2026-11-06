@@ -80,6 +80,11 @@ test('snapshot splits on AVERAGES: flash-holding one hour earns 1/24 weight', as
   s.registerWallet(A, null);
   s.registerWallet(B, null);
   s.registerWallet(C, null);
+  // Pot model: all three wallets registered for the day; the
+  // 500 FRG pot splits pro-rata across their AVERAGE balances.
+  s.registerForDay(DAY, A);
+  s.registerForDay(DAY, B);
+  s.registerForDay(DAY, C);
   s.setDailyPool(500n * FRG);
   // A flash-holds 2,400 FRG for exactly one hour, holds 0 the other 23.
   sampleDay(s, A, DAY, [[0, 2400n * FRG], ...Array.from({ length: 23 }, (_, i) => [i + 1, 0n])]);
@@ -99,6 +104,9 @@ test('snapshot splits on AVERAGES: flash-holding one hour earns 1/24 weight', as
 test('snapshot with samples present stays idempotent per day', async () => {
   const s = tmpStore();
   s.registerWallet(A, null);
+  // Pot model: A is the day's only registrant, so the whole
+  // 10 FRG pot accrues to A — exactly once, never twice.
+  s.registerForDay(DAY, A);
   s.setDailyPool(10n * FRG);
   sampleDay(s, A, DAY, [[0, 50n * FRG]]);
   const first = await runSnapshot(s, async () => 1n, DAY);

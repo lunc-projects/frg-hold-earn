@@ -3,10 +3,13 @@
 // All money values are TEXT holding integer 6-decimal base units, so
 // no float rounding ever touches a balance. Currency is table-scoped:
 // - snapshots / balance_samples hold FRG balances (the held asset);
-// - day_pools / accruals / payments hold USTC base units (denom
-//   "uusd") for the base reward engine;
-// - nft_* ledgers remain FRG, as that separate bonus mechanic was not
-//   converted. See the one-time legacy migration below.
+// - day_pools / accruals / payments hold base-reward amounts in the
+//   LIVE reward asset: FRG→USTC in the one-time legacy conversion
+//   (migration #1), then USTC→FRG in migration #2 (owner ruling
+//   2026-11-05: holders earn FRG). The reward_currency_migrations
+//   table is the ordered record of both switches; day_pools.pool
+//   records the day's POT (see engine.js pot model);
+// - nft_* ledgers remain FRG throughout (separate bonus mechanic).
 // One store = one SQLite file. Production MUST NOT use a local file:
 // Railway's filesystem is ephemeral and a claims ledger wiped on
 // redeploy would double-pay. See README "Production storage TODO"
@@ -16,12 +19,21 @@
 // ─────────────────────────────────────────────────────────────
 import { DatabaseSync } from 'node:sqlite';
 import { isValidTerraAddress, isValidTerraContractAddress } from './engine.js';
+import { FRG_TOKEN } from './assets.js';
 
 export function openStore(path) {
   const db = new DatabaseSync(path);
   db.exec(`
     CREATE TABLE IF NOT EXISTS wallets(
       address TEXT PRIMARY KEY, referrer TEXT, registered_at INTEGER);
+    -- Per-day participation (owner's pot model, 2026-11-05): a row
+    -- means "this wallet registered for THIS day's round". The
+    -- wallets table above is the permanent first-touch referral
+    -- binding; this table is the daily action — a wallet must
+    -- register again every day to be in that day's pot split.
+    CREATE TABLE IF NOT EXISTS day_registrations(
+      day TEXT, wallet TEXT, registered_at INTEGER,
+      PRIMARY KEY(day, wallet));
     CREATE TABLE IF NOT EXISTS snapshots(
       day TEXT, wallet TEXT, balance TEXT,
       PRIMARY KEY(day, wallet));
@@ -69,6 +81,13 @@ export function openStore(path) {
       legacy_id INTEGER PRIMARY KEY AUTOINCREMENT,
       original_id INTEGER, day TEXT, wallet TEXT, kind TEXT, amount TEXT,
       archived_at INTEGER, migration_id INTEGER);
+    -- Migration #2's archive (USTC -> FRG, 2026-11-05): same shape,
+    -- separate table so each archive's denomination is unambiguous
+    -- from its table alone.
+    CREATE TABLE IF NOT EXISTS legacy_ustc_accruals(
+      legacy_id INTEGER PRIMARY KEY AUTOINCREMENT,
+      original_id INTEGER, day TEXT, wallet TEXT, kind TEXT, amount TEXT,
+      archived_at INTEGER, migration_id INTEGER);
     CREATE TABLE IF NOT EXISTS reward_currency_migrations(
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       from_symbol TEXT, to_symbol TEXT, to_denom TEXT,
@@ -76,7 +95,9 @@ export function openStore(path) {
       archived_unpaid_amount TEXT, legacy_daily_pool TEXT,
       migrated_at INTEGER);
   `);
-  // Defaults (only when never set): daily pool 0, affiliate rate 10%.
+  // Defaults (only when never set): daily POT 0, affiliate rate
+  // 10%. Pot 0 is the deliberate safe landing: nothing accrues
+  // until the owner sets the pot amount (engine.js pot model).
   db.prepare(`INSERT OR IGNORE INTO settings(key, value)
               VALUES('daily_pool', '0'), ('affiliate_rate_bps', '1000')`).run();
   // NFT defaults (only when never set): no collection configured
@@ -190,9 +211,94 @@ export function openStore(path) {
       throw e;
     }
   }
+  // ── Migration #2: USTC -> FRG base-reward switch (2026-11-05) ──
+  // Owner ruling: holders earn FRG now; USTC stays a dormant future
+  // option (it drives validator delegation). Modeled exactly on
+  // migration #1, in reverse:
+  // 1. EVERY row then present in the active base `accruals` table
+  //    (USTC-denominated) is copied verbatim to
+  //    `legacy_ustc_accruals`, tagged with this migration's id, then
+  //    removed from the active ledger, so USTC value can never be
+  //    claimed as FRG. Unpaid amounts are computed with migration
+  //    #1's netting rule and recorded.
+  // 2. The numeric daily-pot value is recorded and
+  //    reset to 0: a USTC/day pot must never be silently
+  //    reinterpreted as an FRG/day pot. The owner sets the FRG
+  //    pot amount deliberately after the switch.
+  // 3. Settings reward_denom / reward_symbol are rewritten to the
+  //    FRG descriptor (denom = the CW20 contract address). These
+  //    settings are OPERATIVE: server.js resolves the live reward
+  //    asset from reward_symbol via assets.js.
+  // 4. NFT tables are deliberately untouched (separate FRG mechanic).
+  // Guard: a reward_currency_migrations row with from USTC / to FRG
+  // is this migration's record; if one exists, this is a no-op.
+  // Migration #1's row and archive are never altered.
+  function runUstcToFrgRewardMigration() {
+    const existing = q(
+      `SELECT * FROM reward_currency_migrations
+        WHERE from_symbol = 'USTC' AND to_symbol = 'FRG' ORDER BY id ASC LIMIT 1`);
+    if (existing) return existing;
+
+    const accrualRows = all(`SELECT * FROM accruals ORDER BY id`);
+    const accruedByWallet = new Map();
+    let archivedAmount = 0n;
+    for (const row of accrualRows) {
+      const amount = BigInt(row.amount);
+      archivedAmount += amount;
+      accruedByWallet.set(row.wallet, (accruedByWallet.get(row.wallet) || 0n) + amount);
+    }
+    const paidByWallet = new Map();
+    for (const row of all(
+      `SELECT wallet, amount FROM payments WHERE status IN ('pending', 'confirmed')`)) {
+      paidByWallet.set(row.wallet, (paidByWallet.get(row.wallet) || 0n) + BigInt(row.amount));
+    }
+    let archivedUnpaidAmount = 0n;
+    for (const [wallet, accrued] of accruedByWallet) {
+      const unpaid = accrued - (paidByWallet.get(wallet) || 0n);
+      if (unpaid > 0n) archivedUnpaidAmount += unpaid;
+    }
+    const poolRow = q(`SELECT value FROM settings WHERE key = 'daily_pool'`);
+    const legacyDailyPool = BigInt(poolRow?.value ?? '0');
+    const migratedAt = Date.now();
+
+    try {
+      db.exec('BEGIN');
+      const inserted = run(
+        `INSERT INTO reward_currency_migrations(
+           from_symbol, to_symbol, to_denom, archived_rows, archived_amount,
+           archived_unpaid_amount, legacy_daily_pool, migrated_at)
+         VALUES('USTC', 'FRG', ?, ?, ?, ?, ?, ?)`,
+        FRG_TOKEN,
+        accrualRows.length, String(archivedAmount), String(archivedUnpaidAmount),
+        String(legacyDailyPool), migratedAt);
+      const migrationId = Number(inserted.lastInsertRowid);
+      for (const row of accrualRows) {
+        run(
+          `INSERT INTO legacy_ustc_accruals(
+             original_id, day, wallet, kind, amount, archived_at, migration_id)
+           VALUES(?, ?, ?, ?, ?, ?, ?)`,
+          row.id, row.day, row.wallet, row.kind, row.amount, migratedAt, migrationId);
+      }
+      run(`DELETE FROM accruals`);
+      run(`INSERT INTO settings(key, value) VALUES('daily_pool', '0')
+           ON CONFLICT(key) DO UPDATE SET value = excluded.value`);
+      run(`INSERT INTO settings(key, value) VALUES('reward_denom', ?)
+           ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+          FRG_TOKEN);
+      run(`INSERT INTO settings(key, value) VALUES('reward_symbol', 'FRG')
+           ON CONFLICT(key) DO UPDATE SET value = excluded.value`);
+      db.exec('COMMIT');
+      return q(`SELECT * FROM reward_currency_migrations WHERE id = ?`, migrationId);
+    } catch (e) {
+      try { db.exec('ROLLBACK'); } catch { /* already rolled back */ }
+      throw e;
+    }
+  }
+
   runLegacyFrgRewardMigration();
   db.prepare(`INSERT OR IGNORE INTO settings(key, value)
               VALUES('reward_denom', 'uusd'), ('reward_symbol', 'USTC')`).run();
+  runUstcToFrgRewardMigration();
 
   return {
     db,
@@ -219,21 +325,44 @@ export function openStore(path) {
     },
 
     // --- Settings ---
+    // daily_pool is the DAILY POT (engine.js pot model): the FRG
+    // amount that empties to the day's registered wallets at the
+    // end of the day. 0 = the round is off. The setting key keeps
+    // its historical name.
     getDailyPool() { return BigInt(q(`SELECT value FROM settings WHERE key='daily_pool'`).value); },
     setDailyPool(baseUnits) {
       run(`INSERT INTO settings(key, value) VALUES('daily_pool', ?)
            ON CONFLICT(key) DO UPDATE SET value = excluded.value`, String(baseUnits));
+    },
+
+    // --- Per-day participation (the daily Register action) ---
+    // Idempotent within a day. A wallet not in this table for a
+    // day is NOT in that day's pot split, whatever it holds and
+    // whenever it first bound its referral.
+    registerForDay(day, address) {
+      const existing = q(`SELECT day FROM day_registrations WHERE day = ? AND wallet = ?`, day, address);
+      if (existing) return { day, address, alreadyRegistered: true };
+      run(`INSERT INTO day_registrations(day, wallet, registered_at) VALUES(?, ?, ?)`,
+          day, address, Date.now());
+      return { day, address, alreadyRegistered: false };
+    },
+    isRegisteredForDay(day, address) {
+      return Boolean(q(`SELECT day FROM day_registrations WHERE day = ? AND wallet = ?`, day, address));
+    },
+    dayRegistrations(day) {
+      return all(`SELECT wallet FROM day_registrations WHERE day = ? ORDER BY wallet`, day)
+        .map((r) => r.wallet);
     },
     getAffiliateRateBps() { return Number(q(`SELECT value FROM settings WHERE key='affiliate_rate_bps'`).value); },
     setAffiliateRateBps(bps) {
       run(`INSERT INTO settings(key, value) VALUES('affiliate_rate_bps', ?)
            ON CONFLICT(key) DO UPDATE SET value = excluded.value`, String(bps));
     },
-    // Conversion audit: the first (and only) FRG -> USTC migration
-    // record, or null if this store somehow predates the migration
-    // code without having run it. Amounts are BigInt base units:
-    // archived amounts are legacy FRG; see runLegacyFrgRewardMigration
-    // above for the exact rule.
+    // Conversion audit: the FIRST migration record (FRG -> USTC,
+    // migration #1), or null if this store somehow predates the
+    // migration code without having run it. Amounts are BigInt base
+    // units: archived amounts are legacy FRG; see
+    // runLegacyFrgRewardMigration above for the exact rule.
     getRewardCurrencyMigration() {
       const r = q(`SELECT * FROM reward_currency_migrations ORDER BY id ASC LIMIT 1`);
       if (!r) return null;
@@ -249,15 +378,45 @@ export function openStore(path) {
         migratedAt: r.migrated_at,
       };
     },
+    // ALL migration records, in order (migration #1 FRG -> USTC,
+    // then migration #2 USTC -> FRG). The full switch history.
+    getRewardCurrencyMigrations() {
+      return all(`SELECT * FROM reward_currency_migrations ORDER BY id ASC`).map((r) => ({
+        id: r.id,
+        fromSymbol: r.from_symbol,
+        toSymbol: r.to_symbol,
+        toDenom: r.to_denom,
+        archivedRows: r.archived_rows,
+        archivedAmount: BigInt(r.archived_amount),
+        archivedUnpaidAmount: BigInt(r.archived_unpaid_amount),
+        legacyDailyPool: BigInt(r.legacy_daily_pool),
+        migratedAt: r.migrated_at,
+      }));
+    },
     legacyAccruals() {
       return all(`SELECT * FROM legacy_frg_accruals ORDER BY legacy_id`);
+    },
+    // Migration #2's archive: USTC-denominated accrual rows retired
+    // by the USTC -> FRG switch.
+    legacyUstcAccruals() {
+      return all(`SELECT * FROM legacy_ustc_accruals ORDER BY legacy_id`);
+    },
+    // The OPERATIVE live reward symbol, maintained by the
+    // migrations ('FRG' after migration #2). server.js resolves the
+    // descriptor from this via assets.js — nothing hard-codes the
+    // live currency. Falls back to 'FRG' if somehow unset.
+    getRewardSymbol() {
+      const r = q(`SELECT value FROM settings WHERE key = 'reward_symbol'`);
+      return r?.value || 'FRG';
     },
 
     // --- Daily snapshot + accrual (idempotent per day) ---
     // Returns { skipped: true } if this day already accrued — a second
-    // run for the same day must NEVER double-accrue. Snapshot balances
-    // are FRG weights; pool/shares/bonuses are USTC base units computed
-    // by engine.js.
+    // run for the same day must NEVER double-accrue (this is also what
+    // makes later registrations powerless to change past days).
+    // Snapshot balances are FRG (only the day's REGISTERED
+    // wallets'); `poolBaseUnits` records the day's POT; shares and
+    // bonuses are reward-asset base units from engine.js.
     recordDay(day, poolBaseUnits, snapshotBalances, shares, bonuses) {
       if (q(`SELECT day FROM day_pools WHERE day = ?`, day)) return { skipped: true };
       // node:sqlite has no transaction() helper — explicit BEGIN/COMMIT.
@@ -327,7 +486,8 @@ export function openStore(path) {
       run(`DELETE FROM balance_samples WHERE day < ?`, beforeDay);
     },
 
-    // --- Ledgers (active base ledger: USTC base units) ---
+    // --- Ledgers (active base ledger: live reward asset — FRG
+    // base units since migration #2; see the migration records) ---
     accrued(wallet) {
       const r = q(`SELECT COALESCE(SUM(CAST(amount AS INTEGER)), 0) AS t
                    FROM accruals WHERE wallet = ?`, wallet);

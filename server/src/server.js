@@ -1,10 +1,12 @@
 // ─────────────────────────────────────────────────────────────
 // FRG Hold & Earn — backend API.
 // Holders NEVER send anything: they connect, the server snapshots
-// their FRG balance daily, and they collect USTC rewards the owner
-// funds by depositing USTC into the payout wallet. FRG balances are
-// only the pro-rata weights; every base reward amount is USTC
-// (denom "uusd"). The ONLY wallet that ever sends is the payout
+// their FRG balance daily, and they collect rewards in the LIVE
+// reward asset (assets.js — FRG since migration #2, owner ruling
+// 2026-11-05; USTC remains the dormant future option). Model: each
+// day is its own round — the daily pot empties to the wallets that
+// REGISTERED that day, pro-rata by their snapshot FRG balances
+// (see engine.js). The ONLY wallet that ever sends is the payout
 // wallet (payout.js).
 //
 // Admin auth (v1, stated limitation — see README):
@@ -26,8 +28,8 @@ import { fileURLToPath } from 'node:url';
 import { openStore } from './store.js';
 import {
   computeDay, isValidTerraAddress, parseWholeToBase, formatBaseToWhole,
-  REWARD_DENOM, REWARD_SYMBOL,
 } from './engine.js';
+import { rewardAssetFor } from './assets.js';
 import { createPayout, cw20Balance, FRG_TOKEN } from './payout.js';
 import {
   consolidateNftPower, computeNftDailyBonusByType,
@@ -50,9 +52,12 @@ export function dayString(d = new Date()) {
 }
 
 // Runs one day's snapshot + accrual. Idempotent: a second run for the
-// same day is a no-op (store.recordDay refuses a duplicate day). The
-// FRG balances below are weights only; the configured pool and the
-// resulting accruals are USTC base units.
+// same day is a no-op (store.recordDay refuses a duplicate day). ONLY
+// the wallets that REGISTERED for this day take part: the day's pot
+// splits pro-rata across their FRG snapshot balances and empties
+// completely (engine.js pot model); accruals are reward-asset base
+// units. Wallets bound in the wallets table but not registered for
+// this day are not snapshotted for the base split at all.
 // Balance accuracy (2026-10-25): each wallet's split weight is its
 // AVERAGE sampled balance for the day (hourly samples, see
 // runBalanceSampling) — holding FRG for one hour earns ~1/24 of the
@@ -77,10 +82,13 @@ export function dayString(d = new Date()) {
 // rewards above are completely unaffected.
 export async function runSnapshot(store, fetchBalance, day = dayString(), fetchNftCounts = null) {
   const wallets = store.allWallets();
+  // The day's round = the wallets that registered FOR THIS DAY.
+  const participants = new Set(store.dayRegistrations(day));
   const averages = store.averageBalances(day);
   const balances = [];
   let averaged = 0;
   for (const w of wallets) {
+    if (!participants.has(w.address)) continue;
     const a = averages.get(w.address);
     if (a) {
       balances.push({ wallet: w.address, balance: a.average });
@@ -89,10 +97,10 @@ export async function runSnapshot(store, fetchBalance, day = dayString(), fetchN
       balances.push({ wallet: w.address, balance: await fetchBalance(w.address) });
     }
   }
-  const pool = store.getDailyPool();
+  const pot = store.getDailyPool();
   const referralOf = new Map(wallets.map((w) => [w.address, w.referrer]));
-  const { shares, bonuses } = computeDay(pool, balances, referralOf, store.getAffiliateRateBps());
-  const result = store.recordDay(day, pool, balances, shares, bonuses);
+  const { shares, bonuses } = computeDay(pot, balances, referralOf, store.getAffiliateRateBps());
+  const result = store.recordDay(day, pot, balances, shares, bonuses);
   const total = balances.reduce((s, b) => s + b.balance, 0n);
   let nftOut = null;
   if (fetchNftCounts) {
@@ -118,7 +126,9 @@ export async function runSnapshot(store, fetchBalance, day = dayString(), fetchN
     }
   }
   return {
-    day, wallets: balances.length, totalBalance: total.toString(), pool: pool.toString(),
+    day, wallets: balances.length, totalBalance: total.toString(),
+    pool: pot.toString(), pot: pot.toString(),
+    registered: participants.size,
     ...result, nft: nftOut,
     balanceSource: { averaged, live: balances.length - averaged },
   };
@@ -170,31 +180,38 @@ export function createApp({ store, payout, config }) {
     if (!isValidTerraAddress(addr)) { bad(res, 400, 'invalid Terra address'); return null; }
     return addr;
   };
-  // Base rewards are USTC end to end (additive API fields; the
-  // existing amount field names are unchanged).
+  // Base reward metadata comes from the ONE reward-asset
+  // descriptor (assets.js), resolved from the store's operative
+  // reward_symbol — FRG since migration #2. The frontend renders
+  // these fields; no currency is hard-coded in the page.
+  const rewardAsset = rewardAssetFor(store.getRewardSymbol());
   const rewardMeta = {
-    rewardDenom: REWARD_DENOM,
-    rewardSymbol: REWARD_SYMBOL,
-    rewardCurrency: REWARD_SYMBOL,
+    rewardDenom: rewardAsset.denom,
+    rewardSymbol: rewardAsset.symbol,
+    rewardCurrency: rewardAsset.symbol,
+    rewardAssetKind: rewardAsset.kind,
   };
+  const migrationFields = (m) => ({
+    id: m.id,
+    fromSymbol: m.fromSymbol,
+    toSymbol: m.toSymbol,
+    toDenom: m.toDenom,
+    archivedRows: m.archivedRows,
+    archivedAmount: m.archivedAmount.toString(),
+    archivedAmountWhole: formatBaseToWhole(m.archivedAmount),
+    archivedUnpaidAmount: m.archivedUnpaidAmount.toString(),
+    archivedUnpaidAmountWhole: formatBaseToWhole(m.archivedUnpaidAmount),
+    legacyDailyPool: m.legacyDailyPool.toString(),
+    legacyDailyPoolWhole: formatBaseToWhole(m.legacyDailyPool),
+    migratedAt: m.migratedAt,
+  });
+  // First migration (FRG -> USTC) — kept for the existing admin view.
   const migrationView = () => {
     const m = store.getRewardCurrencyMigration();
-    if (!m) return null;
-    return {
-      id: m.id,
-      fromSymbol: m.fromSymbol,
-      toSymbol: m.toSymbol,
-      toDenom: m.toDenom,
-      archivedRows: m.archivedRows,
-      archivedAmount: m.archivedAmount.toString(),
-      archivedAmountWhole: formatBaseToWhole(m.archivedAmount),
-      archivedUnpaidAmount: m.archivedUnpaidAmount.toString(),
-      archivedUnpaidAmountWhole: formatBaseToWhole(m.archivedUnpaidAmount),
-      legacyDailyPool: m.legacyDailyPool.toString(),
-      legacyDailyPoolWhole: formatBaseToWhole(m.legacyDailyPool),
-      migratedAt: m.migratedAt,
-    };
+    return m ? migrationFields(m) : null;
   };
+  // The full ordered switch history (#1 FRG->USTC, #2 USTC->FRG).
+  const migrationsView = () => store.getRewardCurrencyMigrations().map(migrationFields);
 
   // Per-type bonus rates as exposed on the public/admin views:
   // base-unit strings + whole-FRG strings + the honest "set" flag
@@ -217,8 +234,9 @@ export function createApp({ store, payout, config }) {
   app.get('/api/health', (_req, res) => res.json({ ok: true }));
 
   // Public totals — honest numbers straight from the ledger.
-  // The daily pool and affiliate rate are public program parameters,
-  // not promises: an individual's share depends on snapshots.
+  // The daily pot and affiliate rate are public program parameters,
+  // not promises: an individual's share depends on that day's
+  // registrations and snapshot balances.
   app.get('/api/stats', (_req, res) => res.json({
     holders: store.walletCount(),
     ...rewardMeta,
@@ -228,8 +246,13 @@ export function createApp({ store, payout, config }) {
     snapshotDays: store.snapshotDays(),
     // Count only (no balances): proves the hourly sampler is running.
     balanceSamplesToday: store.sampleStats(dayString()).samples,
+    // The DAILY POT: empties to today's registered wallets at the
+    // end of the day. dailyPool is the historical field name.
     dailyPool: store.getDailyPool().toString(),
     dailyPoolWhole: formatBaseToWhole(store.getDailyPool()),
+    dailyPot: store.getDailyPool().toString(),
+    dailyPotWhole: formatBaseToWhole(store.getDailyPool()),
+    registeredToday: store.dayRegistrations(dayString()).length,
     affiliateRatePercent: store.getAffiliateRateBps() / 100,
     // NFT section (additive — base stats above are untouched).
     nft: (() => {
@@ -266,7 +289,10 @@ export function createApp({ store, payout, config }) {
     }
   });
 
-  // Registration: first-touch wins, binding immutable (store enforces).
+  // Registration: first-touch wins, binding immutable (store
+  // enforces). Registering ALSO enters the wallet in TODAY's round
+  // (the daily pot split) — that part is per-day and must be
+  // repeated each day; the referral binding never changes.
   app.post('/api/register', (req, res) => {
     const addr = validAddr(req, res); if (!addr) return;
     const referrer = (req.body?.referrer || '').trim() || null;
@@ -275,7 +301,9 @@ export function createApp({ store, payout, config }) {
       if (referrer === addr) return bad(res, 400, 'referrer cannot be your own wallet');
     }
     const out = store.registerWallet(addr, referrer);
-    res.json(out);
+    const day = dayString();
+    const reg = store.registerForDay(day, addr);
+    res.json({ ...out, day, registeredForDay: true, alreadyRegisteredToday: reg.alreadyRegistered });
   });
 
   app.get('/api/rewards', (req, res) => {
@@ -285,6 +313,8 @@ export function createApp({ store, payout, config }) {
     res.json({
       address: addr,
       ...rewardMeta,
+      // Is this wallet in TODAY's round? Registration is per-day.
+      registeredToday: store.isRegisteredForDay(dayString(), addr),
       accrued: accrued.toString(), accruedWhole: formatBaseToWhole(accrued),
       paid: paid.toString(), paidWhole: formatBaseToWhole(paid),
       claimable: store.claimable(addr).toString(),
@@ -314,13 +344,14 @@ export function createApp({ store, payout, config }) {
         if (claim <= 0n) throw Object.assign(new Error('nothing to collect yet'), { status: 400 });
         const paymentId = store.createPendingPayment(addr, claim);
         try {
-          // Base rewards pay USTC only: cap against the payout
-          // wallet's ACTUAL USTC (uusd) balance and send via the
-          // native bank-send path — never the FRG CW20 path, which
-          // belongs to the separate NFT bonus mechanic.
-          const balance = await payout.getUstcBalance();
+          // Base rewards pay in the LIVE reward asset: cap against
+          // the payout wallet's ACTUAL reward-asset balance and send
+          // via the descriptor-dispatched path (payout.js) — FRG
+          // CW20 today; the USTC native path revives only if the
+          // USTC descriptor is ever selected again.
+          const balance = await payout.getRewardBalance();
           if (balance < claim) throw Object.assign(new Error('rewards pool empty, top up'), { status: 400 });
-          const txhash = await payout.sendUstc(addr, claim);
+          const txhash = await payout.sendReward(addr, claim);
           store.confirmPayment(paymentId, txhash);
           return {
             paid: claim.toString(), paidWhole: formatBaseToWhole(claim), txhash,
@@ -430,9 +461,10 @@ export function createApp({ store, payout, config }) {
         try {
           const available = store.nftBonusPoolAvailable();
           if (available < claim) throw Object.assign(new Error('bonus pool empty, top up'), { status: 400 });
-          // NFT bonus remains an FRG mechanic by design: this route
-          // intentionally keeps the FRG CW20 balance/send path and
-          // was NOT converted to USTC with the base reward engine.
+          // NFT bonus is an FRG mechanic by design, on its own
+          // ledger and pool: this route intentionally uses the FRG
+          // CW20 balance/send path directly (never the base reward
+          // routing), so the two ledgers can never mix.
           const balance = await payout.getBalance();
           if (balance < claim) throw Object.assign(new Error('rewards pool empty, top up'), { status: 400 });
           const txhash = await payout.send(addr, claim);
@@ -509,20 +541,28 @@ export function createApp({ store, payout, config }) {
       totalAccrued: store.totalAccrued().toString(),
       totalPaid: store.totalPaid().toString(),
       snapshotDays: store.snapshotDays(),
+      // dailyPool = the DAILY POT (empties to the day's registered
+      // wallets). dailyPot is the same number under its plain name.
       dailyPool: store.getDailyPool().toString(),
       dailyPoolWhole: formatBaseToWhole(store.getDailyPool()),
+      dailyPot: store.getDailyPool().toString(),
+      dailyPotWhole: formatBaseToWhole(store.getDailyPool()),
+      registeredToday: store.dayRegistrations(dayString()).length,
       affiliateRateBps: store.getAffiliateRateBps(),
       affiliateRatePercent: store.getAffiliateRateBps() / 100,
       payoutCanSend: payout.configured,
       payoutAddress,
-      // payoutBalance remains the FRG CW20 balance (NFT bonus path /
-      // legacy display). payoutUstcBalance is the live USTC balance
-      // the owner's deposits land in and base Collect caps against.
+      // payoutBalance is the FRG CW20 balance (the live reward
+      // balance AND the NFT bonus path's funding view).
+      // payoutUstcBalance is the wallet's USTC bank balance — the
+      // dormant future option's funding view; base Collect caps
+      // against it only if USTC is ever selected again.
       payoutBalance,
       payoutBalanceWhole: payoutBalance === null ? null : formatBaseToWhole(BigInt(payoutBalance)),
       payoutUstcBalance,
       payoutUstcBalanceWhole: payoutUstcBalance === null ? null : formatBaseToWhole(BigInt(payoutUstcBalance)),
       rewardMigration: migrationView(),
+      rewardMigrations: migrationsView(),
       balanceSamples: store.sampleStats(dayString()),
       nft: (() => {
         const s = store.getNftSettings();
@@ -543,6 +583,9 @@ export function createApp({ store, payout, config }) {
     });
   });
 
+  // Sets the DAILY POT (the daily_pool setting): the FRG amount
+  // that empties to each day's registered wallets at the end of
+  // the day. 0 = rounds off. This is the owner's one number.
   app.post('/api/admin/pool', requireAdmin, (req, res) => {
     try {
       const base = parseWholeToBase(req.body?.poolWhole ?? req.body?.pool);
@@ -550,6 +593,7 @@ export function createApp({ store, payout, config }) {
       store.setDailyPool(base);
       res.json({
         dailyPool: base.toString(), dailyPoolWhole: formatBaseToWhole(base),
+        dailyPot: base.toString(), dailyPotWhole: formatBaseToWhole(base),
         ...rewardMeta,
       });
     } catch { bad(res, 400, 'invalid pool amount'); }
@@ -675,6 +719,9 @@ if (import.meta.url === `file://${process.argv[1]}`) {
     lcdUrl: config.lcdUrl, rpcUrl: config.rpcUrl,
     payoutAddress: config.payoutAddress,
     mnemonic: process.env.FRG_PAYOUT_MNEMONIC || '',
+    // Base-reward routing follows the store's operative reward
+    // asset (FRG since migration #2 — see assets.js / store.js).
+    rewardAsset: rewardAssetFor(store.getRewardSymbol()),
   });
   const app = createApp({ store, payout, config });
   const fetchBalance = (addr) => cw20Balance(config.lcdUrl, FRG_TOKEN, addr);

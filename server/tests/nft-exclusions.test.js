@@ -88,7 +88,9 @@ test('snapshot: excluded holder records 0, accrues 0, is never chain-read; base 
     const store = tempStore();
     store.registerWallet(A, null);
     store.registerWallet(B, null);
-    store.setDailyPool(1_000_000n);
+    store.setDailyPool(1_000_000n); // the day's pot
+    store.registerForDay('2026-10-28', A); // both wallets are in the day's round
+    store.registerForDay('2026-10-28', B);
     store.setNftSettings({
       collections: [COL1, COL2],
       bonusRateBonus: 2_000_000n, // 2 FRG per NFT/day
@@ -109,7 +111,8 @@ test('snapshot: excluded holder records 0, accrues 0, is never chain-read; base 
     // Non-excluded: completely unaffected (2 NFTs x 2 FRG = 4 FRG).
     assert.equal(store.latestNftCount(B), 2);
     assert.equal(store.nftAccrued(B), 4_000_000n);
-    // Base hold-and-earn accrues normally for BOTH (equal FRG weights).
+    // Base hold-and-earn accrues normally for BOTH (equal balances earn
+    // equally; the day's pot splits evenly between them).
     assert.equal(store.accrued(A), 500_000n);
     assert.equal(store.accrued(B), 500_000n);
     assert.deepEqual(store.snapshotDays(), ['2026-10-28']);
@@ -144,7 +147,9 @@ test('snapshot: LCD failure still skips the whole NFT day when an exclusion is s
   const store = tempStore();
   store.registerWallet(A, null);
   store.registerWallet(B, null);
-  store.setDailyPool(1_000_000n);
+  store.setDailyPool(1_000_000n); // the day's pot
+    store.registerForDay('2026-10-28', A); // both wallets are in the day's round
+    store.registerForDay('2026-10-28', B);
   store.setNftSettings({ collections: [COL1, COL2], bonusRateBonus: 2_000_000n, excludedWallets: [A] });
   const fetchNftCount = (addr) => cw721TypeCountsMulti(LCD, store.getNftCollections(), addr);
 
