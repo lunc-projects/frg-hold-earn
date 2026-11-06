@@ -101,8 +101,16 @@ export async function runSnapshot(store, fetchBalance, day = dayString(), fetchN
 // sending anything (the admin preview and the dry run use this;
 // the payout press uses the same builder, so what the owner
 // reviews is exactly what the press computes).
-// Participants: ALL paste-registered wallets — registration is
-// one-time and permanent (no window). Balances: the day's
+// Participants: paste-registered wallets — registration is
+// one-time and permanent (no rolling window). TIMER CUTOFF
+// (owner, 2026-11-05): when the owner has set a split deadline,
+// only wallets whose registration timestamp is AT/BEFORE the
+// deadline take part in this build; wallets registered after it
+// are reported in `lateRegistrations` and stay registered for
+// the NEXT split (they are never removed by the cutoff, and the
+// minimum-holding rule does not touch them in this build). With
+// no deadline set, every registered wallet takes part, exactly
+// as before. Balances: the day's
 // AVERAGE sampled balance when samples exist (hourly sampler —
 // flash-holding earns ~1/24 weight per hour), else a live read.
 // MINIMUM-HOLDING ENFORCEMENT happens here, at the build: any
@@ -128,10 +136,21 @@ export async function buildPayoutTable(store, fetchBalance, { now = new Date(), 
   const windowEnd = now.getTime();
   const windowStart = 0; // one-time registration: no window — all registered wallets
   const regs = store.allRegistrations();
+  // Timer cutoff: with a deadline set, only registrations at or
+  // before it participate. Late registrations are counted and
+  // reported, never removed, and skip this build entirely (no
+  // balance read, no minimum-holding check).
+  const splitDeadlineMs = store.getSplitDeadlineMs();
+  const participants = splitDeadlineMs > 0
+    ? regs.filter((r) => r.registeredAt <= splitDeadlineMs)
+    : regs;
+  const lateRegistrations = splitDeadlineMs > 0
+    ? regs.filter((r) => r.registeredAt > splitDeadlineMs)
+    : [];
   const day = dayString(now);
   const averages = store.averageBalances(day);
   const allBalances = [];
-  for (const r of regs) {
+  for (const r of participants) {
     const a = averages.get(r.wallet);
     if (a) { allBalances.push({ wallet: r.wallet, balance: a.average, src: 'avg' }); }
     else allBalances.push({ wallet: r.wallet, balance: await fetchBalance(r.wallet), src: 'live' });
@@ -171,6 +190,16 @@ export async function buildPayoutTable(store, fetchBalance, { now = new Date(), 
     rows, totalSplit, totalBalance, payoutUsdMicro, amountBase,
     limitBase, poolBalance, potBase, price,
     minHoldingBase, deregistered,
+    // The timer cutoff this build used (null deadline = no timer,
+    // everyone registered took part). registeredBeforeCutoff
+    // counts the wallets that were in before the cutoff (before
+    // minimum-holding removals); lateRegistrations are the
+    // wallets that registered after it and wait for the next
+    // split.
+    splitDeadlineMs: splitDeadlineMs > 0 ? splitDeadlineMs : null,
+    registeredBeforeCutoff: participants.length,
+    registeredAfterCutoff: lateRegistrations.length,
+    lateRegistrations: lateRegistrations.map((r) => r.wallet),
     balanceSource: { averaged, live: balances.length - averaged },
   };
 }
@@ -246,6 +275,13 @@ export async function runPayoutDay(store, payout, fetchBalance, { now = new Date
       potBase: prev?.potBase ?? null, price: null,
       // A recorded day is frozen: no deregistration on a re-press.
       minHoldingBase: store.getMinHoldingBase(), deregistered: [],
+      // The frozen record carries the cutoff the original build
+      // used; a re-press never re-applies a (possibly changed)
+      // deadline to a recorded day.
+      splitDeadlineMs: prev?.detail?.splitDeadlineMs ?? null,
+      registeredBeforeCutoff: prev?.registeredCount ?? rows.length,
+      registeredAfterCutoff: prev?.detail?.registeredAfterCutoff ?? 0,
+      lateRegistrations: prev?.detail?.lateRegistrations ?? [],
       balanceSource: { averaged: 0, live: 0 },
     };
   }
@@ -323,6 +359,11 @@ export async function runPayoutDay(store, payout, fetchBalance, { now = new Date
       deregistered: (table.deregistered ?? []).map((d) => ({
         wallet: d.wallet, balance: d.balance.toString(),
       })),
+      // The timer cutoff this run used (null = no timer set):
+      // wallets registered after it were left for the next split.
+      splitDeadlineMs: table.splitDeadlineMs ?? null,
+      registeredAfterCutoff: table.registeredAfterCutoff ?? 0,
+      lateRegistrations: table.lateRegistrations ?? [],
     },
   };
   store.savePayoutRun(rec);
@@ -455,6 +496,21 @@ export function createApp({ store, payout, config }) {
     minHoldingBase: store.getMinHoldingBase().toString(),
     minHoldingWhole: formatBaseToWhole(store.getMinHoldingBase()),
   });
+  // The split countdown timer (owner, 2026-11-05): the deadline
+  // comes from the SERVER (never the visitor's device clock), and
+  // secondsRemaining is computed against the server's clock at
+  // fetch time — the page anchors its local ticking to this value
+  // so every visitor's clock agrees. No timer set: splitDeadline
+  // and secondsRemaining are null and the page shows no clock.
+  const splitTimerView = () => {
+    const ms = store.getSplitDeadlineMs();
+    if (ms <= 0) return { splitDeadline: null, splitDeadlineMs: null, secondsRemaining: null };
+    return {
+      splitDeadline: new Date(ms).toISOString(),
+      splitDeadlineMs: ms,
+      secondsRemaining: Math.max(0, Math.floor((ms - Date.now()) / 1000)),
+    };
+  };
   const payoutRunView = (run) => (run ? {
     day: run.day, status: run.status, pressedAt: run.pressedAt,
     registeredCount: run.registeredCount,
@@ -483,6 +539,8 @@ export function createApp({ store, payout, config }) {
     ...payoutAmountView(),
     ...limitView(),
     ...minHoldingView(),
+    // The split countdown timer (null deadline = no timer set).
+    ...splitTimerView(),
     // Total wallets registered right now. Registration is
     // one-time and permanent — this is the count the next payout
     // run starts from (a build may still remove below-minimum
@@ -786,6 +844,7 @@ export function createApp({ store, payout, config }) {
       ...payoutAmountView(),
       ...limitView(),
       ...minHoldingView(),
+      ...splitTimerView(),
       registered: store.allRegistrations().length,
       lastPayoutRun: payoutRunView(store.latestPayoutRun()),
       affiliateRateBps: store.getAffiliateRateBps(),
@@ -864,6 +923,46 @@ export function createApp({ store, payout, config }) {
     } catch (e) { bad(res, 400, e.message || 'invalid minimum holding'); }
   });
 
+  // The SPLIT COUNTDOWN TIMER (owner, 2026-11-05). The owner
+  // starts the timer when he announces; holders then have until
+  // the deadline to get their wallet in. The deadline is a
+  // payout-build CUTOFF (see buildPayoutTable): registrations
+  // after it wait for the next split — they are never removed.
+  // START: deadline = now + 24 hours (an explicit `hours` in the
+  // body overrides the length, 0 < hours <= 24*30).
+  app.post('/api/admin/timer/start', requireAdmin, (req, res) => {
+    try {
+      const hours = req.body?.hours === undefined ? 24 : Number(req.body.hours);
+      if (!Number.isFinite(hours) || hours <= 0 || hours > 24 * 30) {
+        throw new Error('timer length must be > 0 and at most 30 days (hours)');
+      }
+      store.setSplitDeadlineMs(Date.now() + Math.round(hours * 3_600_000));
+      res.json({ ...splitTimerView(), ...rewardMeta });
+    } catch (e) { bad(res, 400, e.message || 'invalid timer length'); }
+  });
+
+  // SET an exact deadline: body { deadline: '<ISO timestamp>' }
+  // (a numeric body { deadlineMs } is also accepted). A deadline
+  // in the past is valid — the timer simply reads as run out and
+  // the cutoff still applies at the next build.
+  app.post('/api/admin/timer/set', requireAdmin, (req, res) => {
+    try {
+      let ms = NaN;
+      if (req.body?.deadline !== undefined) ms = Date.parse(String(req.body.deadline));
+      else if (req.body?.deadlineMs !== undefined) ms = Number(req.body.deadlineMs);
+      if (!Number.isFinite(ms) || ms <= 0) throw new Error('deadline must be a valid timestamp');
+      store.setSplitDeadlineMs(ms);
+      res.json({ ...splitTimerView(), ...rewardMeta });
+    } catch (e) { bad(res, 400, e.message || 'invalid deadline'); }
+  });
+
+  // CLEAR/STOP the timer: no deadline — the page shows no clock
+  // and payout builds count every registered wallet again.
+  app.post('/api/admin/timer/clear', requireAdmin, (_req, res) => {
+    store.setSplitDeadlineMs(0);
+    res.json({ ...splitTimerView(), ...rewardMeta });
+  });
+
   // The payout PREVIEW: exactly the table the press will compute
   // (same builder), plus the pool's actual balance and the
   // projected remainder. Records nothing, sends nothing. A price
@@ -907,6 +1006,17 @@ export function createApp({ store, payout, config }) {
           wallet: d.wallet, balance: d.balance.toString(),
           balanceWhole: formatBaseToWhole(d.balance),
         })),
+        // The timer cutoff this preview used (same builder as
+        // the press): with a deadline set, only wallets registered
+        // at/before it are in the table; the late ones stay
+        // registered and wait for the next split. No timer:
+        // splitDeadline is null and every registered wallet was
+        // counted (registeredAfterCutoff is 0).
+        splitDeadline: table.splitDeadlineMs ? new Date(table.splitDeadlineMs).toISOString() : null,
+        splitDeadlineMs: table.splitDeadlineMs,
+        registeredBeforeCutoff: table.registeredBeforeCutoff,
+        registeredAfterCutoff: table.registeredAfterCutoff,
+        lateRegistrations: table.lateRegistrations,
       });
     } catch (e) {
       bad(res, 502, `payout preview failed (the press would halt): ${e.message}`);

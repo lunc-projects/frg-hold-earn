@@ -43,6 +43,22 @@ for the days you were not holding.
    the weight of holding it all day, so flash-holding into the
    snapshot moment does not pay. A wallet with no samples that day
    falls back to a single live read at snapshot time.
+3b. **Split countdown timer** (owner, 2026-11-05): the owner can
+   set a round deadline (`split_deadline_ms`; admin endpoints
+   `POST /api/admin/timer/start` = now + 24h, `/timer/set` = an
+   exact deadline, `/timer/clear` = no timer). The public page
+   shows a big countdown anchored to the **server's** clock
+   (`/api/stats` exposes `splitDeadline`, `splitDeadlineMs` and a
+   server-computed `secondsRemaining`; with no timer set the
+   fields are null and the page shows no clock). The deadline is
+   a payout-build **cutoff**: a build counts only wallets whose
+   registration timestamp is at/before it. Wallets registered
+   after it are **not** removed — they stay registered and are
+   simply in the next split — and the minimum-holding rule does
+   not touch them in that build. The admin preview and the run
+   record show the cutoff used (deadline, wallets in before it
+   vs after it). With no deadline set, builds count every
+   registered wallet, exactly as before.
 3a. **Minimum-holding deregistration** (owner rule, 2026-11-05):
    at each payout build, any registered wallet whose balance —
    the same average-sampled / live-fallback balance the split

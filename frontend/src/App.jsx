@@ -4,8 +4,15 @@ import {
   fetchHoldings, getStats, getBalance, getRewards, getReferrals, register,
   getAdmin, adminSetRate, adminSnapshot, adminSetPayoutAmount, adminSetLimit,
   adminSetMinHolding, adminPayoutPreview, adminRunPayout,
+  adminTimerStart, adminTimerSet, adminTimerClear,
   getNft, collectNftBonus, getAdminNft, adminSetNftSettings, adminFundBonusPool,
 } from './lib/api.js';
+
+const fmtCountdown = (totalSeconds) => {
+  const s = Math.max(0, Math.floor(totalSeconds));
+  const p = (n) => String(n).padStart(2, '0');
+  return `${p(Math.floor(s / 3600))}:${p(Math.floor((s % 3600) / 60))}:${p(s % 60)}`;
+};
 
 // FRG Hold & Earn — PASTE-ONLY. There is no wallet connect and no
 // signing anywhere in this app: pasting an address registers it and
@@ -39,6 +46,20 @@ export default function App() {
   const [rateInput, setRateInput] = useState('');
   const [preview, setPreview] = useState(null);
   const [previewBusy, setPreviewBusy] = useState(false);
+  const [deadlineInput, setDeadlineInput] = useState('');
+  // Split countdown: anchored to the SERVER's secondsRemaining on
+  // every stats load (the visitor's device clock never decides
+  // the deadline), then ticked down locally once a second.
+  const [remaining, setRemaining] = useState(null);
+  useEffect(() => {
+    setRemaining(stats?.splitDeadlineMs ? (stats.secondsRemaining ?? 0) : null);
+  }, [stats]);
+  const timerRunning = remaining !== null && remaining > 0;
+  useEffect(() => {
+    if (!timerRunning) return undefined;
+    const id = setInterval(() => setRemaining((r) => (r === null ? null : Math.max(0, r - 1))), 1000);
+    return () => clearInterval(id);
+  }, [timerRunning]);
   const [payoutBusy, setPayoutBusy] = useState(false);
   const [lastRun, setLastRun] = useState(null);
   const [nftCollectionsInput, setNftCollectionsInput] = useState('');
@@ -205,6 +226,18 @@ export default function App() {
         🔒 <strong>Security:</strong> This app never asks you to connect your wallet or sign anything — you only paste your address. Any version that asks you to connect or sign is a fake.
       </div>
 
+      {stats?.splitDeadlineMs ? (
+        <div className="card countdown">
+          {remaining !== null && remaining > 0 ? (
+            <h2>⏰ Time left to get your wallet in:<span className="clock">{fmtCountdown(remaining)}</span></h2>
+          ) : (
+            <h2>⏰ Time&apos;s up — wallets are locked in for this split.<span className="clock done">00:00:00</span></h2>
+          )}
+          <p>You must get your wallet address in before the timer runs out to be in this split. Registering is one-time — miss this split and you&apos;re in the next one.</p>
+          <p className="muted">Split deadline: {new Date(stats.splitDeadlineMs).toLocaleString()}</p>
+        </div>
+      ) : null}
+
       <div className="card">
         <h2>📋 Paste your wallet address</h2>
         <p className="muted">Paste your address once — you&apos;re registered. Pasting registers your wallet for the daily payout and shows your balance and rewards. That is the only step — nothing is ever sent from your wallet.</p>
@@ -320,6 +353,9 @@ export default function App() {
             <div className="adminstats">
               <p>Holders: {adminStats.holders} · Paid out: {toWhole(adminStats.totalPaid)} {adminStats.rewardSymbol || rewardSymbol} · Accrued: {toWhole(adminStats.totalAccrued)} {adminStats.rewardSymbol || rewardSymbol}</p>
               <p>Registered wallets: {adminStats.registered} · Daily payout amount: ${adminStats.dailyPayoutUsd} total · Daily hard limit: {adminStats.dailyLimitWhole} FRG · Minimum holding: {adminStats.minHoldingWhole} FRG · Affiliate rate: {adminStats.affiliateRatePercent}%</p>
+              <p>Split timer: {adminStats.splitDeadlineMs
+                ? <>⏰ deadline {new Date(adminStats.splitDeadlineMs).toLocaleString()} ({adminStats.secondsRemaining > 0 ? `${fmtCountdown(adminStats.secondsRemaining)} left when this panel loaded` : 'time is up — the cutoff applies at the next build'})</>
+                : 'not set — the page shows no clock and every registered wallet is counted.'}</p>
               <p>Payout wallet: {adminStats.payoutAddress ? <span className="mono">{adminStats.payoutAddress}</span> : 'not set yet'}
                 {adminStats.payoutBalance !== null && <> · FRG balance: {toWhole(adminStats.payoutBalance)} FRG</>}
                 {adminStats.payoutUstcBalance !== null && adminStats.payoutUstcBalance !== undefined && <> · USTC balance (dormant future option): {toWhole(adminStats.payoutUstcBalance)} USTC</>}
@@ -353,6 +389,19 @@ export default function App() {
           <input id="rate-input" type="number" min="0" max="100" step="any" placeholder="e.g. 10" value={rateInput} onChange={(e) => setRateInput(e.target.value)} />
           <button className="cyan" onClick={() => rateInput && doAdmin('Affiliate rate set', () => adminSetRate(adminSecret, address, rateInput))}>Set affiliate rate</button>
 
+          <h2>⏰ Split countdown timer</h2>
+          <p className="muted">Start the timer when you announce — holders then have until the deadline to get their wallet in. A payout build counts only wallets registered at or before the deadline; later ones stay registered and are in the next split. No timer = every registered wallet counts, as before.</p>
+          <button className="cyan" onClick={async () => { await doAdmin('24-hour timer started — the deadline is now + 24 hours', () => adminTimerStart(adminSecret, address)); await loadAdmin(); await loadStats(); }}>▶ Start 24-hour timer</button>
+          <label className="muted" htmlFor="deadline-input">…or set an exact deadline</label>
+          <input id="deadline-input" type="datetime-local" value={deadlineInput} onChange={(e) => setDeadlineInput(e.target.value)} />
+          <button className="cyan" onClick={async () => {
+            const d = new Date(deadlineInput);
+            if (!deadlineInput || Number.isNaN(d.getTime())) { pushLog('Pick a deadline date and time first.'); return; }
+            await doAdmin(`Split deadline set to ${d.toLocaleString()}`, () => adminTimerSet(adminSecret, address, d.toISOString()));
+            await loadAdmin(); await loadStats();
+          }}>Set exact deadline</button>
+          <button className="ghost" onClick={async () => { await doAdmin('Split timer cleared — no deadline in effect', () => adminTimerClear(adminSecret, address)); await loadAdmin(); await loadStats(); }}>⏹ Stop / clear timer</button>
+
           <h2>💸 Daily payout</h2>
           <p className="muted">Review the table first — nothing sends until you press the payout button. The table shows every registered wallet, what it holds, its share, and what it will be paid. Loading the preview also applies the minimum-holding rule: wallets below {preview?.minHoldingWhole ?? '…'} FRG are removed from registration and listed under the table.</p>
           <button className="cyan" disabled={previewBusy} onClick={loadPreview}>{previewBusy ? 'Loading…' : '👁 Load payout preview'}</button>
@@ -360,6 +409,12 @@ export default function App() {
             <div className="adminstats">
               <p>Registered: <strong>{preview.registeredCount}</strong> · Pot: {preview.potWhole} {rewardSymbol} (daily payout amount ${preview.dailyPayoutUsd} at {preview.priceFrgUsd ? `$${preview.priceFrgUsd}` : 'live price'} per FRG · hard limit {preview.limitWhole} {rewardSymbol})
                 {' · '}Pool balance: {preview.poolBalanceWhole} {rewardSymbol} · Pool keeps after payout: {preview.poolRemainderWhole} {rewardSymbol}</p>
+              {preview.splitDeadlineMs ? (
+                <p>⏰ Timer cutoff used: wallets registered by <strong>{new Date(preview.splitDeadlineMs).toLocaleString()}</strong> — <strong>{preview.registeredBeforeCutoff}</strong> in before it · <strong>{preview.registeredAfterCutoff}</strong> after it (they stay registered and wait for the next split).
+                  {preview.lateRegistrations?.length > 0 && <> After the cutoff: {preview.lateRegistrations.map((w) => shortAddr(w)).join(', ')}</>}</p>
+              ) : (
+                <p className="muted">No split timer set — this preview counted every registered wallet.</p>
+              )}
               <table className="payout">
                 <thead><tr><th>Wallet</th><th>Holds</th><th>Share</th><th>Will be paid</th></tr></thead>
                 <tbody>
@@ -388,6 +443,9 @@ export default function App() {
                 {' · '}{lastRun.registeredCount} registered</p>
               {lastRun.detail?.deregistered?.length > 0 && (
                 <p className="warn">Removed from registration at this run (below the minimum holding): {lastRun.detail.deregistered.map((d) => shortAddr(d.wallet)).join(', ')}</p>
+              )}
+              {lastRun.detail?.splitDeadlineMs && (
+                <p className="muted">⏰ This run used the timer cutoff {new Date(lastRun.detail.splitDeadlineMs).toLocaleString()} — {lastRun.detail.registeredAfterCutoff ?? 0} wallet(s) registered after it and waited for the next split.</p>
               )}
               {lastRun.detail?.rows?.map((r) => (
                 <p key={r.wallet} className="mono">{shortAddr(r.wallet)}: share {toWhole(r.amount)} → sent {toWhole(r.sent)} ({r.payStatus}){r.txhash && <> · <a href={`${FINDER}/tx/${r.txhash}`} target="_blank" rel="noreferrer">tx</a></>}</p>

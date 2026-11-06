@@ -146,6 +146,14 @@ export function openStore(path) {
   // admin endpoint; until then it is the shipped placeholder.
   db.prepare(`INSERT OR IGNORE INTO settings(key, value)
               VALUES('min_holding_base', '100000000')`).run();
+  // SPLIT COUNTDOWN TIMER (owner, 2026-11-05): the round deadline
+  // in epoch milliseconds. 0 = no timer set (the page shows no
+  // clock and payout builds count every registered wallet, as
+  // before). When set, a payout build counts only wallets whose
+  // registration timestamp is AT/BEFORE the deadline; later
+  // registrations stay registered for the NEXT split.
+  db.prepare(`INSERT OR IGNORE INTO settings(key, value)
+              VALUES('split_deadline_ms', '0')`).run();
   // NFT defaults (only when never set): no collection configured
   // (bonus holdings read as zero), mint cost 0, threshold 0 (unset),
   // supply cap 0 (unlimited), no bonus pool wallet (bonus payouts
@@ -483,6 +491,22 @@ export function openStore(path) {
     setMinHoldingBase(baseUnits) {
       run(`INSERT INTO settings(key, value) VALUES('min_holding_base', ?)
            ON CONFLICT(key) DO UPDATE SET value = excluded.value`, String(baseUnits));
+    },
+    // (4) SPLIT COUNTDOWN TIMER deadline, epoch milliseconds
+    //     (owner, 2026-11-05). 0 = no timer. When > 0, a payout
+    //     build's participant cutoff is this instant: wallets
+    //     registered AT/BEFORE it are in the split; wallets
+    //     registered after it are NOT in that split (they stay
+    //     registered — they are simply in the next one).
+    getSplitDeadlineMs() {
+      const r = q(`SELECT value FROM settings WHERE key = 'split_deadline_ms'`);
+      const n = r ? Number(r.value) : 0;
+      return Number.isFinite(n) && n > 0 ? Math.trunc(n) : 0;
+    },
+    setSplitDeadlineMs(ms) {
+      const n = Number.isFinite(Number(ms)) && Number(ms) > 0 ? Math.trunc(Number(ms)) : 0;
+      run(`INSERT INTO settings(key, value) VALUES('split_deadline_ms', ?)
+           ON CONFLICT(key) DO UPDATE SET value = excluded.value`, String(n));
     },
 
     // --- Payout runs (owner-pressed, one record per day) ---

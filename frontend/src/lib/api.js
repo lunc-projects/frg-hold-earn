@@ -72,6 +72,15 @@ export const adminSetMinHolding = (secret, address, limitWhole) =>
   api('/api/admin/min-holding', { method: 'POST', headers: adminHeaders(secret, address), body: JSON.stringify({ limitWhole }) });
 export const adminPayoutPreview = (secret, address) =>
   api('/api/admin/payout-preview', { headers: adminHeaders(secret, address) });
+// The split countdown timer: the owner starts it at announcement
+// time (deadline = now + 24h), can set an exact deadline, or
+// clear it. The deadline itself always comes from the server.
+export const adminTimerStart = (secret, address) =>
+  api('/api/admin/timer/start', { method: 'POST', headers: adminHeaders(secret, address), body: JSON.stringify({}) });
+export const adminTimerSet = (secret, address, deadlineIso) =>
+  api('/api/admin/timer/set', { method: 'POST', headers: adminHeaders(secret, address), body: JSON.stringify({ deadline: deadlineIso }) });
+export const adminTimerClear = (secret, address) =>
+  api('/api/admin/timer/clear', { method: 'POST', headers: adminHeaders(secret, address), body: JSON.stringify({}) });
 export const adminRunPayout = (secret, address) =>
   api('/api/admin/payout', { method: 'POST', headers: adminHeaders(secret, address), body: JSON.stringify({}) });
 

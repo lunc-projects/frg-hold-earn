@@ -64,6 +64,15 @@ ol li { margin-bottom: 8px; line-height: 1.45; }
   line-height: 1.5;
 }
 .security strong { color: #fca5a5; }
+/* Split countdown timer: front-and-center when the owner has a
+   round timer running. The deadline comes from the server; this
+   is display only. */
+.card.countdown { border-color: rgba(240, 196, 83, 0.65); text-align: center; }
+.countdown .clock {
+  display: block; font-size: 44px; font-weight: 800; letter-spacing: 2px;
+  color: #f0c453; font-variant-numeric: tabular-nums; margin-top: 4px;
+}
+.countdown .clock.done { color: #fca5a5; }
 table.payout { width: 100%; border-collapse: collapse; font-size: 13px; margin: 8px 0; }
 table.payout th, table.payout td { text-align: right; padding: 5px 6px; border-bottom: 1px solid rgba(255, 255, 255, 0.12); }
 table.payout th:first-child, table.payout td:first-child { text-align: left; }
