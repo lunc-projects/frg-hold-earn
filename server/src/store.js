@@ -18,7 +18,7 @@
 // swapping the backend later does not touch the earnings logic.
 // ─────────────────────────────────────────────────────────────
 import { DatabaseSync } from 'node:sqlite';
-import { isValidTerraAddress, isValidTerraContractAddress, normalizeTiers } from './engine.js';
+import { isValidTerraAddress, isValidTerraContractAddress } from './engine.js';
 import { FRG_TOKEN } from './assets.js';
 
 export function openStore(path) {
@@ -35,19 +35,23 @@ export function openStore(path) {
       day TEXT, wallet TEXT, registered_at INTEGER,
       PRIMARY KEY(day, wallet));
     -- Paste registrations (owner's final model, 2026-11-05): one
-    -- row per wallet with the LAST time it registered (pasting
-    -- again refreshes the timestamp). A payout run includes a
-    -- wallet iff its timestamp is within the 24 hours before the
-    -- run — the rolling eligibility window.
+    -- row per wallet. Registration is ONE-TIME and PERMANENT —
+    -- a payout run includes every wallet in this table, however
+    -- long ago it pasted (registered_at is bookkeeping only).
+    -- The only removal: the minimum-holding rule at a payout
+    -- build deletes the row of a wallet below the limit.
     CREATE TABLE IF NOT EXISTS registrations(
       wallet TEXT PRIMARY KEY, registered_at INTEGER);
     -- Owner-pressed payout runs: one record per day, written when
     -- the owner presses the payout button. The record is the audit
-    -- trail of the run: window, registrations counted, tier table
-    -- and price used, cap, totals owed/paid, shortfall, and the
-    -- per-wallet detail (JSON). Re-presses update the same record;
-    -- payments themselves live in the payments table and net
-    -- against accruals, so a re-press can never double-pay.
+    -- trail of the run: registrations counted, the pot
+    -- (column cap_base), the payout amount in micro-USD (column
+    -- cap_usd_micro, legacy column names kept for schema
+    -- compatibility), total split (column total_owed), total
+    -- paid, shortfall, and the per-wallet detail (JSON).
+    -- Re-presses update the same record; payments themselves
+    -- live in the payments table and net against accruals, so a
+    -- re-press can never double-pay.
     CREATE TABLE IF NOT EXISTS payout_runs(
       day TEXT PRIMARY KEY, status TEXT, pressed_at INTEGER,
       window_start INTEGER, window_end INTEGER, registered_count INTEGER,
@@ -119,12 +123,29 @@ export function openStore(path) {
   // until the owner sets the pot amount (engine.js pot model).
   db.prepare(`INSERT OR IGNORE INTO settings(key, value)
               VALUES('daily_pool', '0'), ('affiliate_rate_bps', '1000')`).run();
-  // Final-model defaults (owner, 2026-11-05): the tier table ships
-  // EMPTY (only the implicit base tier at 0% — the program is off
-  // until the owner sets real tiers), and the daily cap ships at
-  // the owner's chosen $0.50 (micro-USD) total across all holders.
+  // Final-model defaults (owner, 2026-11-05): TWO separate
+  // numbers. (1) The DAILY PAYOUT AMOUNT — the specific amount set
+  // to be split each day — ships at the owner's current value,
+  // $0.50 (micro-USD) total across all holders; a value previously
+  // stored under the legacy 'daily_cap_usd_micro' key (the same
+  // $0.50 from the tier build) is carried over first. (2) The
+  // DAILY HARD LIMIT ships at 2,000 FRG (base units) — an absolute
+  // ceiling only, never a target.
   db.prepare(`INSERT OR IGNORE INTO settings(key, value)
-              VALUES('reward_tiers', '[]'), ('daily_cap_usd_micro', '500000')`).run();
+              SELECT 'daily_payout_usd_micro', value FROM settings
+              WHERE key = 'daily_cap_usd_micro'`).run();
+  db.prepare(`INSERT OR IGNORE INTO settings(key, value)
+              VALUES('daily_payout_usd_micro', '500000'),
+                    ('daily_limit_base', '2000000000')`).run();
+  // MINIMUM HOLDING for registration (owner rule, 2026-11-05):
+  // a registered wallet whose balance at a payout build falls
+  // BELOW this limit is removed from registration entirely.
+  // *** PLACEHOLDER DEFAULT: 100 FRG (100,000,000 base units) ***
+  // This is NOT the owner's chosen number — he picks it next.
+  // It only takes effect when he sets the real value via the
+  // admin endpoint; until then it is the shipped placeholder.
+  db.prepare(`INSERT OR IGNORE INTO settings(key, value)
+              VALUES('min_holding_base', '100000000')`).run();
   // NFT defaults (only when never set): no collection configured
   // (bonus holdings read as zero), mint cost 0, threshold 0 (unset),
   // supply cap 0 (unlimited), no bonus pool wallet (bonus payouts
@@ -379,11 +400,16 @@ export function openStore(path) {
         .map((r) => r.wallet);
     },
 
-    // --- Paste registrations (rolling 24h eligibility window) ---
-    // Pasting an address registers it; pasting again REFRESHES the
-    // timestamp. A payout run at time T includes exactly the
-    // wallets with windowStart < registered_at <= T, where
-    // windowStart = T - 24h (server.js builds the window).
+    // --- Paste registrations (ONE-TIME, permanent — owner rule
+    // 2026-11-05: "They shouldn't have to do it every day if they
+    // are holding") ---
+    // Pasting an address registers the wallet PERMANENTLY: every
+    // payout run includes ALL wallets in this table, however long
+    // ago they pasted. Pasting again is harmless (it only refreshes
+    // the bookkeeping timestamp — eligibility never expires). The
+    // ONLY way off the list is the minimum-holding rule: a payout
+    // build removes a wallet whose balance is below the limit
+    // (removeRegistration), and it rejoins only by pasting again.
     recordRegistration(address, ts = Date.now()) {
       run(`INSERT INTO registrations(wallet, registered_at) VALUES(?, ?)
            ON CONFLICT(wallet) DO UPDATE SET registered_at = excluded.registered_at`,
@@ -394,6 +420,21 @@ export function openStore(path) {
       const r = q(`SELECT registered_at FROM registrations WHERE wallet = ?`, address);
       return r ? r.registered_at : null;
     },
+    // Every currently-registered wallet (the payout participant
+    // list), wallet-sorted for deterministic splits.
+    allRegistrations() {
+      return all(`SELECT wallet, registered_at FROM registrations ORDER BY wallet`)
+        .map((r) => ({ wallet: r.wallet, registeredAt: r.registered_at }));
+    },
+    // Minimum-holding enforcement: drop a wallet from the
+    // registration list entirely. Past accruals/payments in the
+    // ledger are NOT touched — only future participation ends
+    // until the wallet pastes its address again.
+    removeRegistration(address) {
+      run(`DELETE FROM registrations WHERE wallet = ?`, address);
+    },
+    // DEPRECATED (kept for older tests/tools): the pre-2026-11-05
+    // rolling-24h-window query. Eligibility no longer uses it.
     registrationsWithin(windowStart, windowEnd) {
       return all(`SELECT wallet, registered_at FROM registrations
                   WHERE registered_at > ? AND registered_at <= ? ORDER BY wallet`,
@@ -401,35 +442,47 @@ export function openStore(path) {
         .map((r) => ({ wallet: r.wallet, registeredAt: r.registered_at }));
     },
 
-    // --- Reward tiers + daily cap (owner's final model) ---
-    // Tiers are stored as JSON [{minBase: string, pctBps: number}]
-    // and always read back through normalizeTiers (base tier at
-    // minimum 0 guaranteed). The OWNER sets the real numbers.
-    getRewardTiers() {
-      let raw = [];
-      try {
-        const r = q(`SELECT value FROM settings WHERE key = 'reward_tiers'`);
-        const parsed = r ? JSON.parse(r.value) : [];
-        if (Array.isArray(parsed)) raw = parsed;
-      } catch { raw = []; }
-      return normalizeTiers(raw);
+    // --- Daily payout amount + hard limit (owner's final model) ---
+    // TWO separate numbers, never merged:
+    // (1) DAILY PAYOUT AMOUNT in micro-USD (1e6 = $1): the specific
+    //     amount the owner sets to be split that day. Owner's
+    //     current value: $0.50 total across ALL holders. Converted
+    //     to FRG at the payout run's live price. 0 = nothing pays.
+    getDailyPayoutUsdMicro() {
+      const r = q(`SELECT value FROM settings WHERE key = 'daily_payout_usd_micro'`);
+      if (r) return BigInt(r.value);
+      const legacy = q(`SELECT value FROM settings WHERE key = 'daily_cap_usd_micro'`);
+      return legacy ? BigInt(legacy.value) : 500000n;
     },
-    setRewardTiers(tiers) {
-      const table = normalizeTiers(tiers);
-      run(`INSERT INTO settings(key, value) VALUES('reward_tiers', ?)
-           ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
-          JSON.stringify(table.map((t) => ({ minBase: t.minBase.toString(), pctBps: t.pctBps }))));
-      return table;
-    },
-    // Daily cap in micro-USD (1e6 = $1). Owner's number: $0.50
-    // total per day across ALL holders. 0 = cap off.
-    getDailyCapUsdMicro() {
-      const r = q(`SELECT value FROM settings WHERE key = 'daily_cap_usd_micro'`);
-      return r ? BigInt(r.value) : 0n;
-    },
-    setDailyCapUsdMicro(micro) {
-      run(`INSERT INTO settings(key, value) VALUES('daily_cap_usd_micro', ?)
+    setDailyPayoutUsdMicro(micro) {
+      run(`INSERT INTO settings(key, value) VALUES('daily_payout_usd_micro', ?)
            ON CONFLICT(key) DO UPDATE SET value = excluded.value`, String(micro));
+    },
+    // (2) DAILY HARD LIMIT in FRG base units: an absolute ceiling
+    //     on what a day can pay — NOT the pot and NOT a target.
+    //     Owner's number: 2,000 FRG/day. A day never pays more
+    //     than this, and never more than the pool holds.
+    getDailyLimitBase() {
+      const r = q(`SELECT value FROM settings WHERE key = 'daily_limit_base'`);
+      return r ? BigInt(r.value) : 2_000_000_000n;
+    },
+    setDailyLimitBase(baseUnits) {
+      run(`INSERT INTO settings(key, value) VALUES('daily_limit_base', ?)
+           ON CONFLICT(key) DO UPDATE SET value = excluded.value`, String(baseUnits));
+    },
+    // (3) MINIMUM HOLDING in FRG base units (owner rule,
+    //     2026-11-05): at each payout build, a registered wallet
+    //     whose balance is BELOW this is removed from registration
+    //     entirely (it can rejoin only by pasting again). A balance
+    //     AT the limit stays. SHIPPED DEFAULT IS A PLACEHOLDER —
+    //     100 FRG — until the owner sets his real number.
+    getMinHoldingBase() {
+      const r = q(`SELECT value FROM settings WHERE key = 'min_holding_base'`);
+      return r ? BigInt(r.value) : 100_000_000n;
+    },
+    setMinHoldingBase(baseUnits) {
+      run(`INSERT INTO settings(key, value) VALUES('min_holding_base', ?)
+           ON CONFLICT(key) DO UPDATE SET value = excluded.value`, String(baseUnits));
     },
 
     // --- Payout runs (owner-pressed, one record per day) ---
@@ -444,8 +497,8 @@ export function openStore(path) {
              cap_usd_micro = excluded.cap_usd_micro, total_paid = excluded.total_paid,
              shortfall = excluded.shortfall, detail = excluded.detail`,
           rec.day, rec.status, rec.pressedAt, rec.windowStart, rec.windowEnd,
-          rec.registeredCount, String(rec.totalOwed), rec.capBase === null ? null : String(rec.capBase),
-          String(rec.capUsdMicro), String(rec.totalPaid), String(rec.shortfall),
+          rec.registeredCount, String(rec.totalSplit), rec.potBase === null ? null : String(rec.potBase),
+          String(rec.payoutUsdMicro), String(rec.totalPaid), String(rec.shortfall),
           JSON.stringify(rec.detail || []));
     },
     _payoutRunRow(r) {
@@ -454,9 +507,9 @@ export function openStore(path) {
         day: r.day, status: r.status, pressedAt: r.pressed_at,
         windowStart: r.window_start, windowEnd: r.window_end,
         registeredCount: r.registered_count,
-        totalOwed: BigInt(r.total_owed),
-        capBase: r.cap_base === null ? null : BigInt(r.cap_base),
-        capUsdMicro: BigInt(r.cap_usd_micro),
+        totalSplit: BigInt(r.total_owed),
+        potBase: r.cap_base === null ? null : BigInt(r.cap_base),
+        payoutUsdMicro: BigInt(r.cap_usd_micro),
         totalPaid: BigInt(r.total_paid),
         shortfall: BigInt(r.shortfall),
         detail: JSON.parse(r.detail || '[]'),

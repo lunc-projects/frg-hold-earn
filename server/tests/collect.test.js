@@ -196,22 +196,27 @@ test('admin gating: wrong wallet/secret refused, correct pair works', async (t) 
   assert.equal(ok.body.rewardMigrations.length, 2); // #1 FRG->USTC, then #2 USTC->FRG
   assert.equal(ok.body.rewardMigrations[1].fromSymbol, 'USTC');
   assert.equal(ok.body.rewardMigrations[1].toSymbol, 'FRG');
-  const setTiers = await post(base, '/api/admin/tiers',
-    { tiers: [{ minWhole: '0', pct: 0.05 }, { minWhole: '10000', pct: 0.1 }] },
+  const setAmount = await post(base, '/api/admin/payout-amount',
+    { amountUsd: 0.5 },
     { 'x-admin-wallet': ADMIN, 'x-admin-secret': SECRET });
-  assert.equal(setTiers.status, 200);
-  assert.equal(setTiers.body.rewardTiers.length, 2);
-  assert.equal(setTiers.body.rewardTiers[1].minWhole, '10000');
-  assert.equal(setTiers.body.rewardTiers[1].pct, 0.1);
-  assert.equal(setTiers.body.rewardDenom, FRG_TOKEN);
-  const setTiersBad = await post(base, '/api/admin/tiers',
-    { tiers: [{ minWhole: '0', pct: 0.05 }] },
+  assert.equal(setAmount.status, 200);
+  assert.equal(setAmount.body.dailyPayoutUsd, 0.5);
+  assert.equal(setAmount.body.rewardDenom, FRG_TOKEN);
+  const setAmountBad = await post(base, '/api/admin/payout-amount',
+    { amountUsd: 0.5 },
     { 'x-admin-wallet': ADMIN, 'x-admin-secret': 'nope' });
-  assert.equal(setTiersBad.status, 403);
-  const setCap = await post(base, '/api/admin/cap', { capUsd: 0.5 },
+  assert.equal(setAmountBad.status, 403);
+  const setLimit = await post(base, '/api/admin/limit', { limitWhole: '2000' },
     { 'x-admin-wallet': ADMIN, 'x-admin-secret': SECRET });
-  assert.equal(setCap.status, 200);
-  assert.equal(setCap.body.dailyCapUsd, 0.5);
+  assert.equal(setLimit.status, 200);
+  assert.equal(setLimit.body.dailyLimitWhole, '2000');
+  const setMinHolding = await post(base, '/api/admin/min-holding', { limitWhole: '500' },
+    { 'x-admin-wallet': ADMIN, 'x-admin-secret': SECRET });
+  assert.equal(setMinHolding.status, 200);
+  assert.equal(setMinHolding.body.minHoldingWhole, '500');
+  const setMinHoldingBad = await post(base, '/api/admin/min-holding', { limitWhole: '500' },
+    { 'x-admin-wallet': ADMIN, 'x-admin-secret': 'nope' });
+  assert.equal(setMinHoldingBad.status, 403);
   const setRate = await post(base, '/api/admin/rate', { percent: 15 },
     { 'x-admin-wallet': ADMIN, 'x-admin-secret': SECRET });
   assert.equal(setRate.status, 200);
@@ -225,34 +230,40 @@ test('admin endpoints refuse outright when no secret is configured', async (t) =
   assert.equal(r.status, 503);
 });
 
-test('public stats show the tier table + cap in FRG terms', async (t) => {
-  const { server, base, store } = await startApp();
+test('public stats show the two numbers distinctly: payout amount + hard limit', async (t) => {
+  const { server, base } = await startApp();
   t.after(() => { server.closeAllConnections(); server.close(); });
-  store.setRewardTiers([{ minBase: 0n, pctBps: 5 }]);
   const s = await get(base, '/api/stats');
   assert.equal(s.status, 200);
-  assert.equal(s.body.rewardTiers.length, 1);
-  assert.equal(s.body.rewardTiers[0].pct, 0.05);
-  assert.equal(s.body.dailyCapUsd, 0.5); // owner's cap ships as the default
-  assert.equal(s.body.registeredLast24h, 0);
+  assert.equal(s.body.rewardTiers, undefined); // tiers are gone
+  assert.equal(s.body.dailyPayoutUsd, 0.5); // the set amount ships as the default
+  assert.equal(s.body.dailyLimitWhole, '2000'); // the hard limit, a separate number
+  assert.equal(s.body.minHoldingWhole, '100'); // PLACEHOLDER default until the owner sets his number
+  assert.equal(s.body.registered, 0); // total registered (one-time, permanent)
+  assert.equal(s.body.registeredLast24h, undefined); // the 24h window is gone
   assert.equal(s.body.rewardDenom, FRG_TOKEN);
   assert.equal(s.body.rewardSymbol, 'FRG');
   assert.equal(s.body.heldTokenSymbol, 'FRG');
 });
 
-test('paste-register puts the wallet in the rolling 24h window; rewards report it', async (t) => {
+test('paste-register registers the wallet permanently (one-time); rewards report it', async (t) => {
   const { server, base } = await startApp();
   t.after(() => { server.closeAllConnections(); server.close(); });
   const before = await get(base, `/api/rewards?address=${A}`);
-  assert.equal(before.body.registeredInWindow, false);
+  assert.equal(before.body.registered, false);
   const r = await post(base, '/api/register', { address: A, referrer: null });
   assert.equal(r.status, 200);
-  assert.equal(r.body.windowHours, 24);
+  assert.equal(r.body.registered, true);
+  assert.equal(r.body.windowHours, undefined); // no window anymore
   assert.ok(r.body.registeredAt > 0);
   const after = await get(base, `/api/rewards?address=${A}`);
-  assert.equal(after.body.registeredInWindow, true);
+  assert.equal(after.body.registered, true);
+  // Pasting again is harmless: still registered, same view.
+  const again = await post(base, '/api/register', { address: A, referrer: null });
+  assert.equal(again.status, 200);
+  assert.equal(again.body.registered, true);
   const s = await get(base, '/api/stats');
-  assert.equal(s.body.registeredLast24h, 1);
+  assert.equal(s.body.registered, 1); // total count, not a 24h window count
   // Paste-register rejects invalid addresses with a plain error.
   const badAddr = await post(base, '/api/register', { address: 'not-a-wallet', referrer: null });
   assert.equal(badAddr.status, 400);

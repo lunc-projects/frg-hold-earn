@@ -75,30 +75,40 @@ test('runBalanceSampling records every wallet; one failure blocks nobody', async
   assert.equal(s.averageBalances(DAY).has(B), false);
 });
 
+// A price that makes FRG exactly $0.05 (0.5 LUNC per FRG, LUNC
+// at $0.10) — so a $25 set amount is a 500 FRG pot.
+const FAKE_PRICE = {
+  frgReserveBase: 1_000_000n * FRG, luncReserveBase: 500_000n * FRG,
+  luncUsdMicro: 100_000n, pair: 'fake-pair',
+};
+const fakePriceFeed = async () => FAKE_PRICE;
+
 test('payout table splits on AVERAGES: flash-holding one hour earns 1/24 weight', async () => {
   const s = tmpStore();
   s.registerWallet(A, null);
   s.registerWallet(B, null);
   s.registerWallet(C, null);
-  // Final model: all three registered inside the rolling 24h window;
-  // a 100% base tier makes owed == the balance the table uses, so the
-  // table's balances ARE the averaging proof.
+  // Final model: all three registered inside the rolling 24h
+  // window; the split follows the AVERAGED balances the table
+  // uses, so the shares ARE the averaging proof.
   const now = new Date('2026-10-25T23:00:00Z');
   for (const w of [A, B, C]) s.recordRegistration(w, now.getTime() - 3_600_000);
-  s.setRewardTiers([{ minBase: 0n, pctBps: 10000 }]); // 100%/day test tier
-  s.setDailyCapUsdMicro(0n); // cap off: no price feed needed
+  s.setDailyPayoutUsdMicro(25_000_000n); // $25 -> a 500 FRG pot at the fake price
+  s.setMinHoldingBase(0n); // min-holding rule off: this suite tests averaging, not the rule
   // A flash-holds 2,400 FRG for exactly one hour, holds 0 the other 23.
   sampleDay(s, A, DAY, [[0, 2400n * FRG], ...Array.from({ length: 23 }, (_, i) => [i + 1, 0n])]);
   // B steadily holds 100 FRG all 24 hours.
   sampleDay(s, B, DAY, Array.from({ length: 24 }, (_, h) => [h, 100n * FRG]));
   // C has NO samples: falls back to a live read of 300 FRG.
   const fetchBalance = async (addr) => (addr === C ? 300n * FRG : 9999n * FRG);
-  const table = await buildPayoutTable(s, fetchBalance, { now });
-  const owed = Object.fromEntries(table.rows.map((r) => [r.wallet, r.owed]));
-  // Weights: A avg 100, B avg 100, C live 300 -> owed 100/100/300 at 100%.
-  assert.equal(owed[A], 100n * FRG);
-  assert.equal(owed[B], 100n * FRG);
-  assert.equal(owed[C], 300n * FRG);
+  const table = await buildPayoutTable(s, fetchBalance,
+    { now, priceFeed: fakePriceFeed, poolBalance: 1_000_000n * FRG });
+  const shares = Object.fromEntries(table.rows.map((r) => [r.wallet, r.amount]));
+  // Weights: A avg 100, B avg 100, C live 300 (total 500) splitting
+  // a 500 FRG pot -> shares 100/100/300.
+  assert.equal(shares[A], 100n * FRG);
+  assert.equal(shares[B], 100n * FRG);
+  assert.equal(shares[C], 300n * FRG);
   assert.deepEqual(table.balanceSource, { averaged: 2, live: 1 });
 });
 
@@ -107,8 +117,8 @@ test('payout run with samples present pays exactly once per day', async () => {
   s.registerWallet(A, null);
   const now = new Date('2026-10-25T23:00:00Z');
   s.recordRegistration(A, now.getTime() - 3_600_000);
-  s.setRewardTiers([{ minBase: 0n, pctBps: 10000 }]); // owed == balance
-  s.setDailyCapUsdMicro(0n);
+  s.setDailyPayoutUsdMicro(2_500_000n); // $2.50 -> a 50 FRG pot at the fake price
+  s.setMinHoldingBase(0n); // min-holding rule off: this suite tests averaging, not the rule
   sampleDay(s, A, DAY, [[0, 50n * FRG]]); // average balance: 50 FRG
   const sent = [];
   const payout = {
@@ -117,10 +127,10 @@ test('payout run with samples present pays exactly once per day', async () => {
     sendReward: async (to, amount) => { sent.push({ to, amount }); return 'TX1'; },
   };
   const fetchBalance = async () => 1n; // samples exist, so this is never used for A
-  const first = await runPayoutDay(s, payout, fetchBalance, { now });
+  const first = await runPayoutDay(s, payout, fetchBalance, { now, priceFeed: fakePriceFeed });
   assert.equal(first.status, 'completed');
-  assert.equal(s.paid(A), 50n * FRG); // the average, paid once
-  const second = await runPayoutDay(s, payout, fetchBalance, { now });
+  assert.equal(s.paid(A), 50n * FRG); // sole registrant: the whole pot, paid once
+  const second = await runPayoutDay(s, payout, fetchBalance, { now, priceFeed: fakePriceFeed });
   assert.equal(second.status, 'completed');
   assert.equal(s.paid(A), 50n * FRG); // never twice
   assert.equal(sent.length, 1);

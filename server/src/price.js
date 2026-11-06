@@ -1,6 +1,6 @@
 // ─────────────────────────────────────────────────────────────
-// FRG Hold & Earn — live FRG/USD price for the daily cap.
-// The daily cap is stored in USD (owner's $0.50) and must be
+// FRG Hold & Earn — live FRG/USD price for the daily payout amount.
+// The daily payout amount is stored in USD (owner.s $0.50) and must be
 // converted to FRG at each payout run's LIVE price — the FRG
 // amount is never hard-coded.
 //
@@ -58,14 +58,14 @@ export async function fetchFrgUsdPrice({ lcdUrl, fetchImpl = fetch, pair = FRG_L
   return { frgReserveBase, luncReserveBase, luncUsdMicro, pair };
 }
 
-// The cap in FRG base units for a USD cap, at a fetched price:
-//   FRG price (USD/whole) = (luncReserve / frgReserve) × luncUsd
-//   capBase = capUsd × 1e6 / priceUsd
-//           = capUsdMicro × frgReserveBase × 1e6
+// The FRG base units for a USD amount, at a fetched price:
+//   FRG price (USD/whole) = (luncReserve / frgReserve) x LUNC/USD
+//   amountBase = amountUsd x 1e6 / priceUsd
+//              = amountUsdMicro x frgReserveBase x 1e6
 //             / (luncReserveBase × luncUsdMicro)
-// Exact BigInt math, floor (the cap is a maximum — never round up).
-export function capBaseForUsd(capUsdMicro, price) {
-  const cap = BigInt(capUsdMicro);
+// Exact BigInt math, floor (never round an amount up).
+export function amountBaseForUsd(amountUsdMicro, price) {
+  const cap = BigInt(amountUsdMicro);
   if (cap <= 0n) return 0n;
   return (cap * price.frgReserveBase * 1_000_000n) / (price.luncReserveBase * price.luncUsdMicro);
 }

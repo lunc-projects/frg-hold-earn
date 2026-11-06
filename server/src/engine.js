@@ -7,34 +7,42 @@
 // - accruals are denominated in the LIVE reward asset (FRG since
 //   migration #2, 2026-11-05 — owner ruling: holders earn FRG).
 //
-// Model (the owner's FINAL design, 2026-11-05 — replaces the
-// all-holders split, the rate+cap idea, and the daily-pot idea):
-// - Registration is BY PASTE: a holder pastes their wallet address
-//   (no wallet connect anywhere). A registration counts for a
-//   payout run if its timestamp is within the 24 HOURS before the
-//   run (rolling window — the owner's "register within 24 hours").
-// - Each registered wallet is OWED a percentage of its own snapshot
-//   FRG balance. The percentage comes from a TIER TABLE (admin-set):
-//   each tier = a minimum FRG held + a daily percentage; a wallet's
-//   tier is the highest tier whose minimum its balance meets. The
-//   base tier's minimum is 0, so every holder has a tier. No crowd
-//   split, no tenure weighting. Defaults: no tiers beyond the base
-//   tier at 0% = the program is OFF until the owner sets numbers.
-// - A DAILY CAP (admin-set, stored as USD — $0.50 total across ALL
-//   holders) bounds each run: the cap is converted to FRG at the
-//   run's LIVE price; if total owed exceeds the cap, all payments
-//   scale down pro-rata so the day pays exactly the cap. If total
-//   owed is under the cap, owed amounts pay in full. Cap 0 = off.
+// Model (the owner's FINAL design, 2026-11-05 — tiers removed at
+// his direction the same night: "do a simple split"):
+// - Registration is BY PASTE, ONE-TIME and PERMANENT: a holder
+//   pastes their wallet address once (no wallet connect anywhere)
+//   and is in every payout run from then on — "they shouldn't
+//   have to do it every day if they are holding" (owner,
+//   2026-11-05). The ONLY way off the list: at a payout build, a
+//   registered wallet whose balance is below the owner's
+//   MINIMUM HOLDING limit is removed from registration entirely
+//   (server.js enforces it at the build, on the same balance the
+//   split uses; a balance AT the limit stays). It rejoins only
+//   by pasting its address again.
+// - Each day has ONE pot, built from TWO separate owner numbers
+//   (never merged): the DAILY PAYOUT AMOUNT (the specific amount
+//   set to be split that day — USD-denominated, currently $0.50,
+//   converted to FRG at the run's LIVE price) and a HARD LIMIT of
+//   2,000 FRG/day (an absolute ceiling only, never a target).
+//   pot = min(payout amount in FRG, hard limit, pool balance).
+//   Payout amount 0/unset = nothing pays.
+// - The pot is split SIMPLE PRO-RATA BY HOLDINGS: each registered
+//   wallet's share = (its snapshot FRG balance / total FRG held by
+//   all registered wallets) x pot. A wallet's share of the
+//   holdings is its share of the reward. No tiers, no per-tier
+//   rates, no tenure weighting. Shares sum EXACTLY to the pot;
+//   a sole registrant receives the whole pot; a wallet holding
+//   0 FRG receives 0.
 // - Payouts are AUTOMATIC per run but NOT on a timer: the system
 //   computes the table, the owner reviews it and PRESSES THE
 //   BUTTON; only then do sends go out (review-before-press). One
 //   run per day; re-presses never double-pay (payments net against
 //   accruals). Every payment is recorded with its tx hash.
-// - POOL PROTECTION is the point: total paid never exceeds the
-//   payout wallet's actual FRG balance (a second pro-rata scale
-//   applies if owed ever exceeds the balance, and the shortfall is
-//   recorded, still owed). The pool only ever pays what is owed —
-//   it does not empty by design.
+// - POOL PROTECTION: sends never exceed the payout wallet's
+//   actual FRG balance (a pro-rata scale applies if claimable
+//   amounts ever exceed it, and the shortfall is recorded, still
+//   owed). The pool only pays the set amount — it does not empty
+//   by design.
 // - Sub-dust rule: a wallet whose total claimable is below
 //   MIN_PAYOUT_BASE (1 FRG) is not sent a micro-payment; the amount
 //   stays accrued (carried) and is included the next run it takes
@@ -85,65 +93,43 @@ export function formatBaseToWhole(base) {
   return (neg ? '-' : '') + whole.toString() + (frac ? '.' + frac : '');
 }
 
-// ── Tier table ────────────────────────────────────────────────
-// A tier is { minBase: BigInt (FRG base units), pctBps: number
-// (basis points of the balance owed per day; 10000 = 100%) }.
-// normalizeTiers takes raw stored/input tiers and returns the
-// canonical table: sorted by minimum ascending, duplicates by
-// minimum merged (highest pct wins), invalid entries rejected,
-// and the BASE TIER (minimum 0) always present — inserted at 0%
-// when absent, so every holder always has a tier.
-export function normalizeTiers(raw) {
-  if (raw === null || raw === undefined) raw = [];
-  if (!Array.isArray(raw)) throw new Error('tiers must be a list');
-  const byMin = new Map();
-  for (const t of raw) {
-    const minBase = typeof t.minBase === 'bigint' ? t.minBase : BigInt(t.minBase ?? t.min ?? '0');
-    const pctBps = Number(t.pctBps);
-    if (minBase < 0n) throw new Error('tier minimum cannot be negative');
-    if (!Number.isInteger(pctBps) || pctBps < 0 || pctBps > 10000) {
-      throw new Error('tier percentage must be 0–100% (0–10000 bps)');
-    }
-    const prev = byMin.get(minBase.toString());
-    if (!prev || pctBps > prev.pctBps) byMin.set(minBase.toString(), { minBase, pctBps });
+// ── The simple split ──────────────────────────────────────────
+// computeSplit divides a pot PRO-RATA BY HOLDINGS: each wallet's
+// amount = (its balance / total balance of all rows) x pot, exact
+// BigInt math (floor per row). The shares sum EXACTLY to the pot:
+// the few base units lost to flooring go to the largest holder
+// (the same dust rule as scaleAmountsToLimit). Rows:
+// [{wallet, balance, amount}].
+// - pot <= 0 or total balance <= 0: every amount is 0 (nothing
+//   can be split, nothing pays).
+// - A wallet holding 0 FRG gets exactly 0.
+// - A sole registrant receives the full pot (documented behavior
+//   of the simple split — the pot itself is bounded by the daily
+//   payout amount, the hard limit, and the pool balance).
+export function computeSplit(balances, potBase) {
+  const pot = potBase > 0n ? potBase : 0n;
+  const total = balances.reduce((s, r) => s + r.balance, 0n);
+  if (pot <= 0n || total <= 0n) {
+    return balances.map(({ wallet, balance }) => ({ wallet, balance, amount: 0n }));
   }
-  if (!byMin.has('0')) byMin.set('0', { minBase: 0n, pctBps: 0 });
-  return [...byMin.values()].sort((a, b) => (a.minBase < b.minBase ? -1 : a.minBase > b.minBase ? 1 : 0));
-}
-
-// The tier a balance falls in: the highest tier whose minimum the
-// balance MEETS — a balance exactly at a tier minimum gets that
-// tier (boundary rule, owner's spec).
-export function tierForBalance(balance, tiers) {
-  let current = tiers[0];
-  for (const t of tiers) {
-    if (balance >= t.minBase) current = t;
-    else break;
+  const rows = balances.map(({ wallet, balance }) => ({
+    wallet, balance, amount: (balance * pot) / total,
+  }));
+  const distributed = rows.reduce((s, r) => s + r.amount, 0n);
+  const dust = pot - distributed;
+  if (dust > 0n) {
+    let biggest = rows[0];
+    for (const r of rows) if (r.balance > biggest.balance) biggest = r;
+    biggest.amount += dust;
   }
-  return current;
-}
-
-// Owed per wallet: owed = tier percentage × snapshot balance,
-// exact BigInt math (floor). Rows: [{wallet, balance, minBase,
-// pctBps, owed}]. Percentages apply to the wallet's OWN balance
-// only — never to any pool or crowd total.
-export function computeOwed(balances, tiers) {
-  const table = normalizeTiers(tiers);
-  return balances.map(({ wallet, balance }) => {
-    const tier = tierForBalance(balance, table);
-    return {
-      wallet, balance,
-      minBase: tier.minBase, pctBps: tier.pctBps,
-      owed: (balance * BigInt(tier.pctBps)) / 10000n,
-    };
-  });
+  return rows;
 }
 
 // Scale amounts down pro-rata so their sum equals `limit` EXACTLY
-// (used for the daily cap and for the pool-balance guard). If the
-// total already fits, amounts pass through unchanged (the cap is a
-// maximum, not a target). Integer dust goes to the largest amount.
-// Rows keep their other fields; `amount` is rewritten.
+// (used for the payout run's pool-balance guard on sends). If the
+// total already fits, amounts pass through unchanged (the limit is
+// a maximum, not a target). Integer dust goes to the largest
+// amount. Rows keep their other fields; `amount` is rewritten.
 export function scaleAmountsToLimit(rows, limit) {
   const total = rows.reduce((s, r) => s + r.amount, 0n);
   if (total <= limit || total <= 0n) return rows.map((r) => ({ ...r }));
@@ -177,13 +163,13 @@ export function computeBonuses(shares, referralOf, rateBps) {
   return [...byWallet.entries()].map(([wallet, amount]) => ({ wallet, amount }));
 }
 
-// Full day computation: each registered wallet is owed its tier
-// percentage of its own balance; referral bonuses on top (EXTRA).
-// Cap/pool scaling is applied by the caller (server.js), which is
-// the only place that knows the run's live price and pool balance.
-export function computeDay(balances, tiers, referralOf, rateBps) {
-  const owed = computeOwed(balances, tiers);
-  const bonuses = computeBonuses(
-    owed.map(({ wallet, owed: amount }) => ({ wallet, amount })), referralOf, rateBps);
-  return { owed, bonuses };
+// Full day computation: the pot split pro-rata by holdings, plus
+// referral bonuses on top (EXTRA — never deducted from shares).
+// The pot itself is built by the caller (server.js), which is the
+// only place that knows the run's live price, the hard limit, and
+// the pool balance.
+export function computeDay(balances, potBase, referralOf, rateBps) {
+  const shares = computeSplit(balances, potBase);
+  const bonuses = computeBonuses(shares, referralOf, rateBps);
+  return { shares, bonuses };
 }

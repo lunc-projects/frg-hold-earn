@@ -48,8 +48,9 @@ export const getStats = () => api('/api/stats');
 export const getBalance = (address) => api(`/api/balance?address=${address}`);
 export const getRewards = (address) => api(`/api/rewards?address=${address}`);
 export const getReferrals = (address) => api(`/api/referrals?address=${address}`);
-// THE registration call: pasting an address registers it (and
-// refreshes its 24h window). No wallet connect exists in this app.
+// THE registration call: pasting an address registers it ONCE,
+// permanently. Pasting again just shows the wallet's view. No
+// wallet connect exists in this app.
 export const register = (address, referrer) =>
   api('/api/register', { method: 'POST', body: JSON.stringify({ address, referrer }) });
 
@@ -63,10 +64,12 @@ export const adminSetRate = (secret, address, percent) =>
   api('/api/admin/rate', { method: 'POST', headers: adminHeaders(secret, address), body: JSON.stringify({ percent }) });
 export const adminSnapshot = (secret, address) =>
   api('/api/admin/snapshot', { method: 'POST', headers: adminHeaders(secret, address) });
-export const adminSetTiers = (secret, address, tiers) =>
-  api('/api/admin/tiers', { method: 'POST', headers: adminHeaders(secret, address), body: JSON.stringify({ tiers }) });
-export const adminSetCap = (secret, address, capUsd) =>
-  api('/api/admin/cap', { method: 'POST', headers: adminHeaders(secret, address), body: JSON.stringify({ capUsd }) });
+export const adminSetPayoutAmount = (secret, address, amountUsd) =>
+  api('/api/admin/payout-amount', { method: 'POST', headers: adminHeaders(secret, address), body: JSON.stringify({ amountUsd }) });
+export const adminSetLimit = (secret, address, limitWhole) =>
+  api('/api/admin/limit', { method: 'POST', headers: adminHeaders(secret, address), body: JSON.stringify({ limitWhole }) });
+export const adminSetMinHolding = (secret, address, limitWhole) =>
+  api('/api/admin/min-holding', { method: 'POST', headers: adminHeaders(secret, address), body: JSON.stringify({ limitWhole }) });
 export const adminPayoutPreview = (secret, address) =>
   api('/api/admin/payout-preview', { headers: adminHeaders(secret, address) });
 export const adminRunPayout = (secret, address) =>

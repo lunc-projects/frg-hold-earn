@@ -12,10 +12,11 @@ so buying just before a payout and selling right after earns nothing
 for the days you were not holding.
 
 > **Status: CORE BUILD COMPLETE. Affiliate program = STUB ONLY.**
-> The core (hold → paste-register → snapshot → owed = tier % ×
-> holdings, $0.50/day total cap at the live price → the owner
-> reviews the table and presses the payout button → automatic
-> sends) is built and tested. The affiliate
+> The core (hold → paste-register ONCE (permanent) → snapshot →
+> the day's pot = min(daily payout amount at the live price,
+> 2,000 FRG hard limit, pool balance) → SIMPLE pro-rata split by
+> holdings → the owner reviews the table and presses the payout
+> button → automatic sends) is built and tested. The affiliate
 > program is NOT finished: referral link capture/storage and a
 > configurable rate exist, but the rate (default 10%) is a
 > **proposed default, UNCONFIRMED**, and the affiliate rules are
@@ -24,14 +25,17 @@ for the days you were not holding.
 
 ## How it works
 
-1. A holder **pastes their wallet address**. Pasting registers the
-   wallet: an optional `?ref=<wallet>` link records their referrer
-   (first touch wins, the binding can never be changed later), and
-   the registration **timestamp** is set. A payout run includes a
-   wallet iff its timestamp is within the **24 hours before the
-   run** (rolling window — the owner's "register within 24 hours"
-   rule). Pasting again refreshes the timestamp. Invalid addresses
-   are rejected with a plain error and nothing is recorded.
+1. A holder **pastes their wallet address once**. Pasting registers
+   the wallet **permanently** (owner rule, 2026-11-05: "they
+   shouldn't have to do it every day if they are holding"): an
+   optional `?ref=<wallet>` link records their referrer (first
+   touch wins, the binding can never be changed later), and the
+   wallet joins the registration list for good — every payout run
+   includes ALL registered wallets, however long ago they pasted.
+   Pasting again is harmless (it just shows the wallet's view).
+   The ONLY way off the list is the minimum-holding rule (step
+   3a). Invalid addresses are rejected with a plain error and
+   nothing is recorded.
 2. The backend samples every registered wallet's FRG balance (live
    from the Terra Classic LCD) **once an hour**. Once a day, the
    snapshot fixes each wallet's weight as its **average sampled
@@ -39,26 +43,39 @@ for the days you were not holding.
    the weight of holding it all day, so flash-holding into the
    snapshot moment does not pay. A wallet with no samples that day
    falls back to a single live read at snapshot time.
-3. Each registered wallet is **owed a percentage of its own FRG
-   balance**, from the **tier table** (owner-set): each tier is a
-   minimum FRG held plus a daily percentage; a wallet's tier is the
-   highest tier whose minimum its snapshot balance meets (a balance
-   exactly at a minimum gets that tier; the base tier's minimum is
-   0, so every holder has a tier). No crowd split, no time bonuses,
-   no duration multipliers, no loyalty weighting. Defaults: no tiers
-   beyond the base tier at 0% — the program is OFF until the owner
-   sets real tier numbers. Changing tiers never alters a recorded
-   day. Every reward amount is FRG (CW20, 6 decimals) — see the
-   reward-currency migrations below.
-3b. A **daily cap of $0.50 total across ALL holders** (owner-set,
-   stored in USD) bounds each run: the cap is converted to FRG at
+3a. **Minimum-holding deregistration** (owner rule, 2026-11-05):
+   at each payout build, any registered wallet whose balance —
+   the same average-sampled / live-fallback balance the split
+   uses — is **below the owner's minimum-holding limit** is
+   **removed from the registration list entirely**. It receives
+   nothing that day and takes no part in later runs until it
+   pastes its address again (one-time registration applies again
+   from that paste). A balance **at** the limit stays. The limit
+   is admin-settable (`min_holding_base`, FRG base units);
+   **the shipped default of 100 FRG is a PLACEHOLDER — the owner
+   picks the real number next.** Removed wallets are listed in
+   the preview and in the run record.
+3. The day's pot comes from **two separate owner numbers, never
+   merged**: (1) the **DAILY PAYOUT AMOUNT** — the specific amount
+   set to be split that day (owner-set, stored in USD; current
+   value **$0.50 total across ALL holders**), converted to FRG at
    the run's **live price** (FRG/LUNC pair reserves via LCD +
    LUNC/USD via CoinPaprika — see `price.js`; the FRG amount is
-   never hard-coded). If total owed exceeds the cap, all payments
-   scale down pro-rata so the day pays exactly the cap; if owed is
-   under the cap, owed amounts pay in full. **A price-feed failure
-   halts the run and pays nothing — a price is never guessed.**
-   Cap 0 = off.
+   never hard-coded); and (2) a **HARD LIMIT of 2,000 FRG/day** —
+   an absolute ceiling only, never a target.
+   **pot = min(payout amount in FRG, hard limit, pool balance).**
+   The pot is split **simple pro-rata by holdings**: each
+   registered wallet's share = (its snapshot FRG balance ÷ total
+   FRG held by all registered wallets) × pot — its share of the
+   holdings is its share of the reward. Shares sum EXACTLY to the
+   pot (rounding dust to the largest holder); a sole registrant
+   receives the whole pot; a wallet holding 0 FRG receives 0. No
+   tiers, no per-tier rates, no tenure weighting. **A price-feed
+   failure halts the run and pays nothing — a price is never
+   guessed.** Payout amount 0/unset = nothing pays (and no price
+   is consulted). Changing any setting never alters a recorded
+   day. Every reward amount is FRG (CW20, 6 decimals) — see the
+   reward-currency migrations below.
 4. At the end of the day the system computes the payout table; the
    **owner reviews it in the admin panel and presses the payout
    button** — only then do sends go out, automatically, from the
@@ -91,9 +108,10 @@ for the days you were not holding.
 - **Affiliate bonus is EXTRA, funded from the same reward pot** — never
   deducted from the referral's share or from other holders' shares.
   Consequence the admin must fund for: **one day's total cost =
-  the day's owed total (bounded by the $0.50 cap) + referral
-  bonuses.** The hard cap at payout time is the payout wallet's
-  actual FRG balance.
+  the day's split (the pot: the set payout amount, bounded by the
+  2,000 FRG hard limit and the pool balance) + referral bonuses.**
+  The hard bound at payout time is the payout wallet's actual FRG
+  balance.
 
 ## Reward-currency migrations (two one-time switches, auditable)
 
@@ -242,9 +260,12 @@ yet — they are env vars with a TODO, not invented values.
       asks to connect or sign is a fake.
 - [ ] Affiliate design session with the owner (rate, rules, wording)
       — the 10% default is proposed, not final.
-- [ ] Tier table set by the owner (percentages per tier — ships at
-      0%, program off, until he sets real numbers). The daily cap
-      ships at his chosen $0.50/day total.
+- [x] Tier table REMOVED by the owner (2026-11-05): the split is
+      simple pro-rata by holdings. The daily payout amount ships
+      at his chosen $0.50/day total; the hard limit ships at
+      2,000 FRG/day.
+- [ ] Minimum-holding limit set by the owner — the shipped
+      100 FRG default is a PLACEHOLDER until he picks the number.
 
 ## Project layout
 
@@ -255,7 +276,7 @@ frg-hold-earn/
     src/
       main.jsx         # plain React root — no wallet providers
       App.jsx          # paste-register / holdings / rewards /
-                       # tiers / referrals / admin + payout button
+                       # referrals / admin + payout button
       config.js        # FRG token, admin fallback, LCD/RPC/Finder
       chainDef.js wallets.js polyfills.js   # copied LNC-app pattern
       lib/api.js       # backend calls + direct LCD balance
@@ -268,7 +289,7 @@ frg-hold-earn/
       assets.js        # the ONE reward-asset descriptor (FRG live;
                        # USTC dormant future option)
       price.js         # live FRG/USD (pair reserves + CoinPaprika)
-                       # for the $0.50/day cap conversion
+                       # for the daily payout amount conversion
       payout.js        # the ONLY sender (base rewards route through
                        # the descriptor: FRG CW20 today; the USTC
                        # native bank-send path stays, dormant)

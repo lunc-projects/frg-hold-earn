@@ -2,17 +2,21 @@
 // FRG Hold & Earn — backend API.
 // Holders NEVER send anything and NEVER connect a wallet: they
 // PASTE their address (paste-only app — a version asking to
-// connect or sign is a fake). Pasting registers the wallet; a
-// payout run includes the wallets registered within the 24 hours
-// before the run. Each is owed its TIER percentage of its own FRG
-// balance (engine.js tier table), the day's total is bounded by
-// the $0.50/day cap converted at the run's live price, and the
-// pool only ever pays what is owed. Sends happen ONLY when the
-// owner presses the payout button (review-before-press) — no
-// timer ever sends. Rewards are the LIVE reward asset (assets.js
-// — FRG since migration #2; USTC remains the dormant future
-// option). The ONLY wallet that ever sends is the payout wallet
-// (payout.js).
+// connect or sign is a fake). Pasting registers the wallet ONCE,
+// permanently — every payout run includes ALL registered wallets
+// (owner rule, 2026-11-05). The one way off the list: at a payout
+// build, a registered wallet whose balance is below the owner's
+// MINIMUM HOLDING limit is removed from registration entirely
+// (it rejoins only by pasting again). The day's pot is the DAILY PAYOUT AMOUNT the
+// owner set (USD — currently $0.50 total — converted to FRG at
+// the run's live price), bounded by a HARD LIMIT of 2,000 FRG/day
+// and by the pool's actual balance, and split SIMPLE PRO-RATA by
+// holdings (engine.js computeSplit — no tiers). Sends happen ONLY
+// when the owner presses the payout button (review-before-press)
+// — no timer ever sends. Rewards are the LIVE reward asset
+// (assets.js — FRG since migration #2; USTC remains the dormant
+// future option). The ONLY wallet that ever sends is the payout
+// wallet (payout.js).
 //
 // Admin auth (v1, stated limitation — see README):
 // admin endpoints require BOTH headers:
@@ -32,10 +36,10 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { openStore } from './store.js';
 import {
-  computeOwed, computeBonuses, scaleAmountsToLimit, normalizeTiers,
+  computeSplit, computeBonuses, scaleAmountsToLimit,
   MIN_PAYOUT_BASE, isValidTerraAddress, parseWholeToBase, formatBaseToWhole,
 } from './engine.js';
-import { fetchFrgUsdPrice, capBaseForUsd, frgUsdPrice } from './price.js';
+import { fetchFrgUsdPrice, amountBaseForUsd, frgUsdPrice } from './price.js';
 import { rewardAssetFor } from './assets.js';
 import { createPayout, cw20Balance, FRG_TOKEN } from './payout.js';
 import {
@@ -93,66 +97,91 @@ export async function runSnapshot(store, fetchBalance, day = dayString(), fetchN
   return { day, wallets: wallets.length, nft: nftOut, base: 'payout-run-only' };
 }
 
-export const REGISTRATION_WINDOW_MS = 24 * 60 * 60 * 1000;
-
 // Builds the payout table for a run at `now` WITHOUT recording or
 // sending anything (the admin preview and the dry run use this;
 // the payout press uses the same builder, so what the owner
 // reviews is exactly what the press computes).
-// Participants: wallets whose paste-registration timestamp is in
-// the rolling 24h window (now-24h, now]. Balances: the day's
+// Participants: ALL paste-registered wallets — registration is
+// one-time and permanent (no window). Balances: the day's
 // AVERAGE sampled balance when samples exist (hourly sampler —
 // flash-holding earns ~1/24 weight per hour), else a live read.
-// Owed: tier % × balance (engine). Cap: when the USD cap is on and
-// anything is owed, the price is fetched LIVE — a price failure
-// throws (the caller halts the run; a price is never guessed).
-export async function buildPayoutTable(store, fetchBalance, { now = new Date(), priceFeed } = {}) {
+// MINIMUM-HOLDING ENFORCEMENT happens here, at the build: any
+// registered wallet whose balance (same source as the split) is
+// BELOW the owner's minimum-holding limit is REMOVED from the
+// registration list entirely and takes no part in this or any
+// later run until it pastes its address again. A balance AT the
+// limit stays. Removed wallets are reported in `deregistered`.
+// (windowStart/windowEnd survive in the table/run record shape
+// for schema compatibility only: windowStart is 0 — "all
+// registrations, ever" — and windowEnd is the build time.)
+// The pot (owner's two numbers, never merged):
+//   pot = min(daily payout amount converted at the LIVE price,
+//             2,000 FRG hard limit, pool balance when known)
+// The price is fetched whenever a payout amount is set and any
+// registered wallet actually holds FRG — a price failure throws
+// (the caller halts the run; a price is never guessed). The pot
+// is then split simple pro-rata by holdings (engine computeSplit):
+// the rows' amounts sum EXACTLY to the pot whenever anyone
+// registered holds FRG; payout amount 0/unset means pot 0 —
+// nothing pays and no price is consulted.
+export async function buildPayoutTable(store, fetchBalance, { now = new Date(), priceFeed, poolBalance = null } = {}) {
   const windowEnd = now.getTime();
-  const windowStart = windowEnd - REGISTRATION_WINDOW_MS;
-  const regs = store.registrationsWithin(windowStart, windowEnd);
+  const windowStart = 0; // one-time registration: no window — all registered wallets
+  const regs = store.allRegistrations();
   const day = dayString(now);
   const averages = store.averageBalances(day);
-  const balances = [];
-  let averaged = 0;
+  const allBalances = [];
   for (const r of regs) {
     const a = averages.get(r.wallet);
-    if (a) { balances.push({ wallet: r.wallet, balance: a.average }); averaged++; }
-    else balances.push({ wallet: r.wallet, balance: await fetchBalance(r.wallet) });
+    if (a) { allBalances.push({ wallet: r.wallet, balance: a.average, src: 'avg' }); }
+    else allBalances.push({ wallet: r.wallet, balance: await fetchBalance(r.wallet), src: 'live' });
   }
-  const tiers = store.getRewardTiers();
-  const owedRows = computeOwed(balances, tiers);
-  const totalOwed = owedRows.reduce((s, r) => s + r.owed, 0n);
-  const capUsdMicro = store.getDailyCapUsdMicro();
-  let price = null;
-  let capBase = null;
-  let scaledToCap = false;
-  let rows = owedRows.map((r) => ({ ...r, scaled: r.owed }));
-  if (capUsdMicro > 0n && totalOwed > 0n) {
-    if (!priceFeed) throw new Error('price feed unavailable');
-    price = await priceFeed(); // throws on any source failure -> halt
-    capBase = capBaseForUsd(capUsdMicro, price);
-    if (totalOwed > capBase) {
-      scaledToCap = true;
-      const scaled = scaleAmountsToLimit(
-        owedRows.map((r) => ({ ...r, amount: r.owed })), capBase);
-      rows = scaled.map((r) => ({ ...r, scaled: r.amount }));
+  // Minimum-holding deregistration (owner rule, 2026-11-05):
+  // below the limit -> off the registration list entirely.
+  const minHoldingBase = store.getMinHoldingBase();
+  const balances = [];
+  const deregistered = [];
+  for (const b of allBalances) {
+    if (b.balance < minHoldingBase) {
+      store.removeRegistration(b.wallet);
+      deregistered.push({ wallet: b.wallet, balance: b.balance });
+    } else {
+      balances.push(b);
     }
   }
-  const totalScaled = rows.reduce((s, r) => s + r.scaled, 0n);
+  const averaged = balances.filter((b) => b.src === 'avg').length;
+  const payoutUsdMicro = store.getDailyPayoutUsdMicro();
+  const limitBase = store.getDailyLimitBase();
+  const totalBalance = balances.reduce((s, r) => s + r.balance, 0n);
+  let price = null;
+  let amountBase = null;
+  let potBase = 0n;
+  if (payoutUsdMicro > 0n && totalBalance > 0n) {
+    if (!priceFeed) throw new Error('price feed unavailable');
+    price = await priceFeed(); // throws on any source failure -> halt
+    amountBase = amountBaseForUsd(payoutUsdMicro, price);
+    potBase = amountBase;
+    if (potBase > limitBase) potBase = limitBase;
+    if (poolBalance !== null && potBase > poolBalance) potBase = poolBalance;
+  }
+  const rows = computeSplit(balances, potBase);
+  const totalSplit = rows.reduce((s, r) => s + r.amount, 0n);
   return {
-    day, windowStart, windowEnd, registeredCount: regs.length,
-    rows, totalOwed, totalScaled, capUsdMicro, capBase, price, scaledToCap,
-    tiers, balanceSource: { averaged, live: balances.length - averaged },
+    day, windowStart, windowEnd, registeredCount: balances.length,
+    rows, totalSplit, totalBalance, payoutUsdMicro, amountBase,
+    limitBase, poolBalance, potBase, price,
+    minHoldingBase, deregistered,
+    balanceSource: { averaged, live: balances.length - averaged },
   };
 }
 
 // THE owner-pressed payout run. One run per day:
 // 1. If the day is not recorded yet, the table is built (above)
-//    and the day's accruals are recorded ONCE from the scaled
-//    amounts (frozen forever — later tier changes or registrations
-//    can never alter a recorded day). A price failure at this
-//    point HALTS the run: a 'halted_price' run record is saved,
-//    nothing is recorded, nothing is paid.
+//    and the day's accruals are recorded ONCE from the split
+//    amounts (frozen forever — later setting changes or
+//    registrations can never alter a recorded day). A price
+//    failure at this point HALTS the run: a 'halted_price' run
+//    record is saved, nothing is recorded, nothing is paid.
 // 2. Pay phase: each participant's CLAIMABLE (all accruals minus
 //    all payments — so carried sub-dust amounts from earlier days
 //    join in) is sent via the payout wallet's reward path, when it
@@ -167,17 +196,22 @@ export async function buildPayoutTable(store, fetchBalance, { now = new Date(), 
 //    claimable — a wallet can never be paid twice for a day.
 export async function runPayoutDay(store, payout, fetchBalance, { now = new Date(), priceFeed } = {}) {
   const day = dayString(now);
-  const capUsdMicro = store.getDailyCapUsdMicro();
+  const payoutUsdMicro = store.getDailyPayoutUsdMicro();
   let table = null;
   if (!store.dayRecorded(day)) {
+    // The pool balance bounds the pot, so read it before building
+    // the table. If the read fails, the table is built without it
+    // and the pay phase's own pool guard still bounds the sends.
+    let poolBalance = null;
+    try { poolBalance = await payout.getRewardBalance(); } catch { poolBalance = null; }
     try {
-      table = await buildPayoutTable(store, fetchBalance, { now, priceFeed });
+      table = await buildPayoutTable(store, fetchBalance, { now, priceFeed, poolBalance });
     } catch (e) {
       const rec = {
         day, status: 'halted_price', pressedAt: now.getTime(),
-        windowStart: now.getTime() - REGISTRATION_WINDOW_MS, windowEnd: now.getTime(),
-        registeredCount: store.registrationsWithin(now.getTime() - REGISTRATION_WINDOW_MS, now.getTime()).length,
-        totalOwed: 0n, capBase: null, capUsdMicro, totalPaid: 0n, shortfall: 0n,
+        windowStart: 0, windowEnd: now.getTime(),
+        registeredCount: store.allRegistrations().length,
+        totalSplit: 0n, potBase: null, payoutUsdMicro, totalPaid: 0n, shortfall: 0n,
         detail: { rows: [], price: null, error: `payout halted: ${e.message}` },
       };
       store.savePayoutRun(rec);
@@ -185,36 +219,34 @@ export async function runPayoutDay(store, payout, fetchBalance, { now = new Date
     }
     const referralOf = new Map(store.allWallets().map((w) => [w.address, w.referrer]));
     const bonuses = computeBonuses(
-      table.rows.map(({ wallet, scaled }) => ({ wallet, amount: scaled })),
+      table.rows.map(({ wallet, amount }) => ({ wallet, amount })),
       referralOf, store.getAffiliateRateBps());
-    store.recordDay(day, table.totalScaled,
+    store.recordDay(day, table.potBase,
       table.rows.map(({ wallet, balance }) => ({ wallet, balance })),
-      table.rows.map(({ wallet, scaled }) => ({ wallet, amount: scaled })),
+      table.rows.map(({ wallet, amount }) => ({ wallet, amount })),
       bonuses);
   } else {
     // Day already recorded (re-press): rebuild the display table
     // from the frozen record — amounts never recompute.
     const snaps = store.daySnapshots(day);
-    const tiers = store.getRewardTiers();
-    const owedRows = computeOwed(snaps, tiers);
-    const rows = snaps.map((s) => {
-      const o = owedRows.find((r) => r.wallet === s.wallet);
-      return {
-        wallet: s.wallet, balance: s.balance,
-        minBase: o.minBase, pctBps: o.pctBps, owed: o.owed,
-        scaled: store.accrualForDay(day, s.wallet, 'share'),
-      };
-    });
+    const rows = snaps.map((s) => ({
+      wallet: s.wallet, balance: s.balance,
+      amount: store.accrualForDay(day, s.wallet, 'share'),
+    }));
     const prev = store.getPayoutRun(day);
     table = {
-      day, windowStart: prev?.windowStart ?? now.getTime() - REGISTRATION_WINDOW_MS,
+      day, windowStart: prev?.windowStart ?? 0,
       windowEnd: prev?.windowEnd ?? now.getTime(),
       registeredCount: prev?.registeredCount ?? rows.length,
       rows,
-      totalOwed: rows.reduce((s, r) => s + r.owed, 0n),
-      totalScaled: rows.reduce((s, r) => s + r.scaled, 0n),
-      capUsdMicro, capBase: prev?.capBase ?? null, price: null,
-      scaledToCap: false, tiers, balanceSource: { averaged: 0, live: 0 },
+      totalSplit: rows.reduce((s, r) => s + r.amount, 0n),
+      totalBalance: rows.reduce((s, r) => s + r.balance, 0n),
+      payoutUsdMicro, amountBase: null,
+      limitBase: store.getDailyLimitBase(), poolBalance: null,
+      potBase: prev?.potBase ?? null, price: null,
+      // A recorded day is frozen: no deregistration on a re-press.
+      minHoldingBase: store.getMinHoldingBase(), deregistered: [],
+      balanceSource: { averaged: 0, live: 0 },
     };
   }
 
@@ -267,13 +299,12 @@ export async function runPayoutDay(store, payout, fetchBalance, { now = new Date
     day, status, pressedAt: now.getTime(),
     windowStart: table.windowStart, windowEnd: table.windowEnd,
     registeredCount: table.registeredCount,
-    totalOwed: table.totalOwed, capBase: table.capBase, capUsdMicro,
+    totalSplit: table.totalSplit, potBase: table.potBase, payoutUsdMicro,
     totalPaid, shortfall,
     detail: {
       rows: table.rows.map((r) => ({
         wallet: r.wallet, balance: r.balance.toString(),
-        tierMin: r.minBase.toString(), pctBps: r.pctBps,
-        owed: r.owed.toString(), scaled: r.scaled.toString(),
+        amount: r.amount.toString(),
         claimable: (r.claimable ?? 0n).toString(),
         sent: (r.sendAmount ?? 0n).toString(),
         txhash: r.txhash || null, payStatus: r.payStatus || null,
@@ -285,11 +316,17 @@ export async function runPayoutDay(store, payout, fetchBalance, { now = new Date
         frgReserveBase: table.price.frgReserveBase.toString(),
         luncReserveBase: table.price.luncReserveBase.toString(),
       } : null,
-      scaledToCap: table.scaledToCap,
+      amountBase: table.amountBase === null ? null : table.amountBase.toString(),
+      limitBase: table.limitBase.toString(),
+      poolBalance: table.poolBalance === null ? null : table.poolBalance.toString(),
+      minHoldingBase: (table.minHoldingBase ?? 0n).toString(),
+      deregistered: (table.deregistered ?? []).map((d) => ({
+        wallet: d.wallet, balance: d.balance.toString(),
+      })),
     },
   };
   store.savePayoutRun(rec);
-  return { ...rec, scaledToCap: table.scaledToCap };
+  return rec;
 }
 
 // One sampling round: record every registered wallet's current FRG
@@ -398,26 +435,33 @@ export function createApp({ store, payout, config }) {
   const priceFeedLive = config.priceFeed
     || (() => fetchFrgUsdPrice({ lcdUrl: config.lcdUrl }));
 
-  // Tier table as exposed publicly/admin: whole-FRG minimums and
-  // percentages (bps / 100). Public program parameters, not
-  // promises — an individual's owed amount depends on their own
-  // snapshot balance and tier.
-  const tiersView = () => store.getRewardTiers().map((t) => ({
-    minBase: t.minBase.toString(),
-    minWhole: formatBaseToWhole(t.minBase),
-    pctBps: t.pctBps,
-    pct: t.pctBps / 100,
-  }));
-  const capView = () => ({
-    dailyCapUsdMicro: store.getDailyCapUsdMicro().toString(),
-    dailyCapUsd: Number(store.getDailyCapUsdMicro()) / 1_000_000,
+  // The program's two numbers, exposed publicly/admin as distinct
+  // fields: the DAILY PAYOUT AMOUNT (USD — the amount set to be
+  // split each day) and the DAILY HARD LIMIT (FRG — a ceiling
+  // only, never a promised amount).
+  const payoutAmountView = () => ({
+    dailyPayoutUsdMicro: store.getDailyPayoutUsdMicro().toString(),
+    dailyPayoutUsd: Number(store.getDailyPayoutUsdMicro()) / 1_000_000,
+  });
+  const limitView = () => ({
+    dailyLimitBase: store.getDailyLimitBase().toString(),
+    dailyLimitWhole: formatBaseToWhole(store.getDailyLimitBase()),
+  });
+  // The minimum holding a registered wallet must keep to STAY
+  // registered (below it at a payout build = removed from the
+  // list). Ships with a PLACEHOLDER default of 100 FRG until the
+  // owner sets his real number.
+  const minHoldingView = () => ({
+    minHoldingBase: store.getMinHoldingBase().toString(),
+    minHoldingWhole: formatBaseToWhole(store.getMinHoldingBase()),
   });
   const payoutRunView = (run) => (run ? {
     day: run.day, status: run.status, pressedAt: run.pressedAt,
     registeredCount: run.registeredCount,
-    totalOwed: run.totalOwed.toString(), totalOwedWhole: formatBaseToWhole(run.totalOwed),
-    capBase: run.capBase === null ? null : run.capBase.toString(),
-    capUsdMicro: run.capUsdMicro.toString(),
+    totalSplit: run.totalSplit.toString(), totalSplitWhole: formatBaseToWhole(run.totalSplit),
+    potBase: run.potBase === null ? null : run.potBase.toString(),
+    potWhole: run.potBase === null ? null : formatBaseToWhole(run.potBase),
+    payoutUsdMicro: run.payoutUsdMicro.toString(),
     totalPaid: run.totalPaid.toString(), totalPaidWhole: formatBaseToWhole(run.totalPaid),
     shortfall: run.shortfall.toString(),
     detail: run.detail,
@@ -433,12 +477,17 @@ export function createApp({ store, payout, config }) {
     snapshotDays: store.snapshotDays(),
     // Count only (no balances): proves the hourly sampler is running.
     balanceSamplesToday: store.sampleStats(dayString()).samples,
-    // The tier table + daily cap are the program's public shape.
-    rewardTiers: tiersView(),
-    ...capView(),
-    // Wallets registered inside the rolling 24h window right now —
-    // the count the next payout run will include.
-    registeredLast24h: store.registrationsWithin(Date.now() - REGISTRATION_WINDOW_MS, Date.now()).length,
+    // The daily payout amount + hard limit are the program's
+    // public shape (two distinct numbers), plus the minimum
+    // holding a registered wallet must keep.
+    ...payoutAmountView(),
+    ...limitView(),
+    ...minHoldingView(),
+    // Total wallets registered right now. Registration is
+    // one-time and permanent — this is the count the next payout
+    // run starts from (a build may still remove below-minimum
+    // wallets, per the rule above).
+    registered: store.allRegistrations().length,
     lastPayoutRun: payoutRunView(store.latestPayoutRun()),
     affiliateRatePercent: store.getAffiliateRateBps() / 100,
     // NFT section (additive — base stats above are untouched).
@@ -477,12 +526,14 @@ export function createApp({ store, payout, config }) {
   });
 
   // Registration: THE paste path (the app is paste-only — no
-  // wallet connect exists). Pasting a valid address registers it:
-  // the first-touch referral binding is recorded (immutable), and
-  // the registration TIMESTAMP is set/refreshed — a payout run
-  // includes the wallet iff the timestamp is within the 24 hours
-  // before the run. Invalid addresses are rejected with a plain
-  // error; nothing is recorded for them.
+  // wallet connect exists). Pasting a valid address registers it
+  // PERMANENTLY (one-time — owner rule, 2026-11-05): the
+  // first-touch referral binding is recorded (immutable) and the
+  // wallet joins the registration list for good. Pasting again
+  // later is harmless — it just shows the wallet's balance/rewards
+  // view; the only way off the list is the minimum-holding rule
+  // at a payout build. Invalid addresses are rejected with a
+  // plain error; nothing is recorded for them.
   app.post('/api/register', (req, res) => {
     const addr = validAddr(req, res); if (!addr) return;
     const referrer = (req.body?.referrer || '').trim() || null;
@@ -492,7 +543,7 @@ export function createApp({ store, payout, config }) {
     }
     const out = store.registerWallet(addr, referrer);
     const reg = store.recordRegistration(addr, Date.now());
-    res.json({ ...out, registeredAt: reg.registeredAt, windowHours: 24 });
+    res.json({ ...out, registeredAt: reg.registeredAt, registered: true });
   });
 
   app.get('/api/rewards', (req, res) => {
@@ -503,10 +554,9 @@ export function createApp({ store, payout, config }) {
     res.json({
       address: addr,
       ...rewardMeta,
-      // Is this wallet inside the rolling 24h window right now?
+      // Is this wallet on the (permanent) registration list?
       registeredAt,
-      registeredInWindow: registeredAt !== null
-        && registeredAt > Date.now() - REGISTRATION_WINDOW_MS,
+      registered: registeredAt !== null,
       accrued: accrued.toString(), accruedWhole: formatBaseToWhole(accrued),
       paid: paid.toString(), paidWhole: formatBaseToWhole(paid),
       claimable: store.claimable(addr).toString(),
@@ -733,9 +783,10 @@ export function createApp({ store, payout, config }) {
       totalAccrued: store.totalAccrued().toString(),
       totalPaid: store.totalPaid().toString(),
       snapshotDays: store.snapshotDays(),
-      rewardTiers: tiersView(),
-      ...capView(),
-      registeredLast24h: store.registrationsWithin(Date.now() - REGISTRATION_WINDOW_MS, Date.now()).length,
+      ...payoutAmountView(),
+      ...limitView(),
+      ...minHoldingView(),
+      registered: store.allRegistrations().length,
       lastPayoutRun: payoutRunView(store.latestPayoutRun()),
       affiliateRateBps: store.getAffiliateRateBps(),
       affiliateRatePercent: store.getAffiliateRateBps() / 100,
@@ -772,38 +823,45 @@ export function createApp({ store, payout, config }) {
     });
   });
 
-  // Sets the TIER TABLE: [{minWhole, pct}] — minimum FRG held and
-  // the daily percentage owed for that tier. The base tier
-  // (minimum 0) is always present after normalization. Changing
-  // tiers never alters a recorded day: recorded days pay from
-  // their frozen accruals.
-  app.post('/api/admin/tiers', requireAdmin, (req, res) => {
+  // Sets the DAILY PAYOUT AMOUNT in USD — the specific amount to
+  // be split between all registered holders that day (owner's
+  // current value: $0.50). Stored as micro-USD; converted to FRG
+  // at each run's live price. 0 = nothing pays that day. Changing
+  // it never alters a recorded day: recorded days pay from their
+  // frozen accruals.
+  app.post('/api/admin/payout-amount', requireAdmin, (req, res) => {
     try {
-      const input = req.body?.tiers;
-      if (!Array.isArray(input)) throw new Error('tiers must be a list');
-      const tiers = input.map((t) => {
-        const pct = Number(t?.pct);
-        if (!Number.isFinite(pct) || pct < 0 || pct > 100) throw new Error('tier pct must be 0–100');
-        const bps = Math.round(pct * 100);
-        if (Math.abs(pct * 100 - bps) > 1e-9) throw new Error('tier pct supports 2 decimal places');
-        return { minBase: parseWholeToBase(String(t?.minWhole ?? '0')), pctBps: bps };
-      });
-      store.setRewardTiers(tiers);
-      res.json({ rewardTiers: tiersView(), ...rewardMeta });
-    } catch (e) { bad(res, 400, e.message || 'invalid tiers'); }
+      const usd = Number(req.body?.amountUsd);
+      if (!Number.isFinite(usd) || usd < 0 || usd > 1_000_000) throw new Error('payout amount must be a USD amount ≥ 0');
+      const micro = BigInt(Math.round(usd * 1_000_000));
+      store.setDailyPayoutUsdMicro(micro);
+      res.json({ ...payoutAmountView(), ...rewardMeta });
+    } catch (e) { bad(res, 400, e.message || 'invalid payout amount'); }
   });
 
-  // Sets the DAILY CAP in USD (total across ALL holders per day;
-  // owner's number: $0.50). Stored as micro-USD; converted to FRG
-  // at each run's live price. 0 = cap off.
-  app.post('/api/admin/cap', requireAdmin, (req, res) => {
+  // Sets the DAILY HARD LIMIT in FRG (whole-token amount) — an
+  // absolute ceiling on a day's payout, never a target (owner's
+  // number: 2,000 FRG/day). A day never pays more than this.
+  app.post('/api/admin/limit', requireAdmin, (req, res) => {
     try {
-      const usd = Number(req.body?.capUsd);
-      if (!Number.isFinite(usd) || usd < 0 || usd > 1_000_000) throw new Error('cap must be a USD amount ≥ 0');
-      const micro = BigInt(Math.round(usd * 1_000_000));
-      store.setDailyCapUsdMicro(micro);
-      res.json({ ...capView(), ...rewardMeta });
-    } catch (e) { bad(res, 400, e.message || 'invalid cap'); }
+      const base = parseWholeToBase(String(req.body?.limitWhole ?? ''));
+      store.setDailyLimitBase(base);
+      res.json({ ...limitView(), ...rewardMeta });
+    } catch (e) { bad(res, 400, e.message || 'invalid limit'); }
+  });
+
+  // Sets the MINIMUM HOLDING in FRG (whole-token amount) — the
+  // balance a registered wallet must keep to STAY registered. At
+  // each payout build, a registered wallet below this is removed
+  // from the registration list entirely (rejoin = paste again).
+  // SHIPPED DEFAULT IS A PLACEHOLDER (100 FRG) until the owner
+  // sets his real number here.
+  app.post('/api/admin/min-holding', requireAdmin, (req, res) => {
+    try {
+      const base = parseWholeToBase(String(req.body?.limitWhole ?? ''));
+      store.setMinHoldingBase(base);
+      res.json({ ...minHoldingView(), ...rewardMeta });
+    } catch (e) { bad(res, 400, e.message || 'invalid minimum holding'); }
   });
 
   // The payout PREVIEW: exactly the table the press will compute
@@ -812,33 +870,43 @@ export function createApp({ store, payout, config }) {
   // failure surfaces as 502 — the press would halt the same way.
   app.get('/api/admin/payout-preview', requireAdmin, async (_req, res) => {
     try {
-      const table = await buildPayoutTable(store, fetchBalanceLive, { priceFeed: priceFeedLive });
       let poolBalance = null;
       try { poolBalance = await payout.getRewardBalance(); } catch { /* show null */ }
-      const totalToSend = table.rows.reduce((s, r) => s + r.scaled, 0n);
+      const table = await buildPayoutTable(store, fetchBalanceLive, { priceFeed: priceFeedLive, poolBalance });
+      const totalToSend = table.totalSplit;
       res.json({
         day: table.day,
         windowStart: table.windowStart, windowEnd: table.windowEnd,
         registeredCount: table.registeredCount,
         rows: table.rows.map((r) => ({
           wallet: r.wallet, balance: r.balance.toString(), balanceWhole: formatBaseToWhole(r.balance),
-          tierMinWhole: formatBaseToWhole(r.minBase), pct: r.pctBps / 100,
-          owed: r.owed.toString(), owedWhole: formatBaseToWhole(r.owed),
-          scaled: r.scaled.toString(), scaledWhole: formatBaseToWhole(r.scaled),
+          sharePct: table.totalBalance > 0n
+            ? Number((r.balance * 10000n) / table.totalBalance) / 100 : 0,
+          amount: r.amount.toString(), amountWhole: formatBaseToWhole(r.amount),
         })),
-        totalOwed: table.totalOwed.toString(), totalOwedWhole: formatBaseToWhole(table.totalOwed),
-        totalScaled: table.totalScaled.toString(), totalScaledWhole: formatBaseToWhole(table.totalScaled),
-        scaledToCap: table.scaledToCap,
-        capUsdMicro: table.capUsdMicro.toString(),
-        dailyCapUsd: Number(table.capUsdMicro) / 1_000_000,
-        capBase: table.capBase === null ? null : table.capBase.toString(),
-        capWhole: table.capBase === null ? null : formatBaseToWhole(table.capBase),
+        totalSplit: table.totalSplit.toString(), totalSplitWhole: formatBaseToWhole(table.totalSplit),
+        potBase: table.potBase.toString(), potWhole: formatBaseToWhole(table.potBase),
+        payoutUsdMicro: table.payoutUsdMicro.toString(),
+        dailyPayoutUsd: Number(table.payoutUsdMicro) / 1_000_000,
+        amountBase: table.amountBase === null ? null : table.amountBase.toString(),
+        amountWhole: table.amountBase === null ? null : formatBaseToWhole(table.amountBase),
+        limitBase: table.limitBase.toString(),
+        limitWhole: formatBaseToWhole(table.limitBase),
         priceFrgUsd: table.price ? frgUsdPrice(table.price) : null,
         poolBalance: poolBalance === null ? null : poolBalance.toString(),
         poolBalanceWhole: poolBalance === null ? null : formatBaseToWhole(poolBalance),
         poolRemainder: poolBalance === null ? null : (poolBalance - totalToSend).toString(),
         poolRemainderWhole: poolBalance === null ? null : formatBaseToWhole(poolBalance - totalToSend),
-        rewardTiers: tiersView(),
+        // Minimum-holding enforcement at this build: wallets
+        // below the limit were REMOVED from registration and are
+        // not in the table (the press will see the same list —
+        // the build already applied the rule).
+        minHoldingBase: table.minHoldingBase.toString(),
+        minHoldingWhole: formatBaseToWhole(table.minHoldingBase),
+        deregistered: table.deregistered.map((d) => ({
+          wallet: d.wallet, balance: d.balance.toString(),
+          balanceWhole: formatBaseToWhole(d.balance),
+        })),
       });
     } catch (e) {
       bad(res, 502, `payout preview failed (the press would halt): ${e.message}`);
@@ -853,7 +921,7 @@ export function createApp({ store, payout, config }) {
     if (!payout.configured) return bad(res, 503, 'payout wallet not configured yet');
     try {
       const run = await payoutMutex(() => runPayoutDay(store, payout, fetchBalanceLive, { priceFeed: priceFeedLive }));
-      res.json({ ...payoutRunView(run), scaledToCap: run.scaledToCap ?? null, halted: run.status === 'halted_price' });
+      res.json({ ...payoutRunView(run), halted: run.status === 'halted_price' });
     } catch (e) {
       bad(res, 502, `payout run failed: ${e.message}`);
     }

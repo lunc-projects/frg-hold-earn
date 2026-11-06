@@ -2,8 +2,8 @@ import { useCallback, useEffect, useState } from 'react';
 import { ADMIN_ADDRESS, FINDER, toWhole, shortAddr } from './config.js';
 import {
   fetchHoldings, getStats, getBalance, getRewards, getReferrals, register,
-  getAdmin, adminSetRate, adminSnapshot, adminSetTiers, adminSetCap,
-  adminPayoutPreview, adminRunPayout,
+  getAdmin, adminSetRate, adminSnapshot, adminSetPayoutAmount, adminSetLimit,
+  adminSetMinHolding, adminPayoutPreview, adminRunPayout,
   getNft, collectNftBonus, getAdminNft, adminSetNftSettings, adminFundBonusPool,
 } from './lib/api.js';
 
@@ -33,8 +33,9 @@ export default function App() {
   const [adminSecret, setAdminSecret] = useState('');
   const [adminStats, setAdminStats] = useState(null);
   const [adminNft, setAdminNft] = useState(null);
-  const [tierRows, setTierRows] = useState([]); // [{minWhole, pct}]
-  const [capInput, setCapInput] = useState('');
+  const [payoutInput, setPayoutInput] = useState('');
+  const [limitInput, setLimitInput] = useState('');
+  const [minHoldingInput, setMinHoldingInput] = useState('');
   const [rateInput, setRateInput] = useState('');
   const [preview, setPreview] = useState(null);
   const [previewBusy, setPreviewBusy] = useState(false);
@@ -77,8 +78,9 @@ export default function App() {
     if (n.status === 'fulfilled') setNft(n.value);
   }, [pushLog]);
 
-  // THE door: paste an address -> it registers (or refreshes its
-  // 24h window) and its view loads. Invalid input is a plain error.
+  // THE door: paste an address -> it registers ONCE, permanently,
+  // and its view loads. Pasting again later just shows the view.
+  // Invalid input is a plain error.
   const doRegister = async () => {
     const addr = paste.trim();
     if (!ADDR_RE.test(addr)) {
@@ -91,8 +93,8 @@ export default function App() {
       const out = await register(addr, ref && ref !== addr ? ref : null);
       setAddress(addr);
       pushLog(out.created
-        ? '✅ Registered! Your wallet is now in the 24-hour window for the next payout.'
-        : '✅ Registration refreshed — your wallet is in the 24-hour window for the next payout.');
+        ? '✅ Registered! Paste once — you\'re registered. As long as you hold FRG, you\'re in every day\'s split.'
+        : '✅ You\'re registered — this paste just shows your wallet view. Registration is one-time and permanent.');
       await refreshViews(addr);
       await loadStats();
     } catch (e) {
@@ -131,8 +133,9 @@ export default function App() {
     const out = await doAdmin('Admin stats loaded', () => getAdmin(adminSecret, address));
     if (out) {
       setAdminStats(out);
-      setTierRows((out.rewardTiers || []).map((t) => ({ minWhole: t.minWhole, pct: String(t.pct) })));
-      setCapInput(String(out.dailyCapUsd ?? ''));
+      setPayoutInput(String(out.dailyPayoutUsd ?? ''));
+      setLimitInput(String(out.dailyLimitWhole ?? ''));
+      setMinHoldingInput(String(out.minHoldingWhole ?? ''));
     }
   };
 
@@ -141,23 +144,12 @@ export default function App() {
     if (out) setAdminNft(out);
   };
 
-  const saveTiers = async () => {
-    const tiers = tierRows
-      .filter((r) => r.minWhole !== '' && r.pct !== '')
-      .map((r) => ({ minWhole: r.minWhole, pct: Number(r.pct) }));
-    const out = await doAdmin('Tier table saved', () => adminSetTiers(adminSecret, address, tiers));
-    if (out) {
-      setTierRows((out.rewardTiers || []).map((t) => ({ minWhole: t.minWhole, pct: String(t.pct) })));
-      await loadStats();
-    }
-  };
-
   const loadPreview = async () => {
     setPreviewBusy(true);
     try {
       const out = await adminPayoutPreview(adminSecret, address);
       setPreview(out);
-      pushLog(`Preview loaded: ${out.registeredCount} wallet(s) in the 24h window.`);
+      pushLog(`Preview loaded: ${out.registeredCount} registered wallet(s) in the split.`);
     } catch (e) {
       pushLog(`Preview failed: ${e.message}`);
     } finally {
@@ -215,7 +207,7 @@ export default function App() {
 
       <div className="card">
         <h2>📋 Paste your wallet address</h2>
-        <p className="muted">Pasting your address registers your wallet for the daily payout and shows your balance and rewards. That is the only step — nothing is ever sent from your wallet.</p>
+        <p className="muted">Paste your address once — you&apos;re registered. Pasting registers your wallet for the daily payout and shows your balance and rewards. That is the only step — nothing is ever sent from your wallet.</p>
         <input
           type="text" placeholder="terra1…" value={paste}
           onChange={(e) => setPaste(e.target.value)}
@@ -236,9 +228,9 @@ export default function App() {
           <p>FRG in your wallet: <span className="big">{holdings === null ? '…' : toWhole(holdings)}</span> FRG</p>
           {rewards && (
             <>
-              <p>{rewards.registeredInWindow
-                ? <span className="gold">✅ Registered — you are in the 24-hour window for the next payout.</span>
-                : <span className="warn">Not in the current 24-hour window — paste your address above again to re-register before the next payout.</span>}</p>
+              <p>{rewards.registered
+                ? <span className="gold">✅ Registered — you are in every day&apos;s split while you hold FRG.</span>
+                : <span className="warn">Not registered — paste your address above to register (one time only).</span>}</p>
               <p>Accrued: <span className="big">{toWhole(rewards.accrued)}</span> {rewardSymbol}
                 {' · '}Already paid to you: {toWhole(rewards.paid)} {rewardSymbol}</p>
               <p>Carried (below the 1 {rewardSymbol} send minimum, pays out once it adds up): <span className="gold">{toWhole(rewards.claimable)}</span> {rewardSymbol}</p>
@@ -253,20 +245,13 @@ export default function App() {
         <h2>📊 How much you earn</h2>
         {stats ? (
           <>
-            <p className="muted">Every day, you are paid a percentage of the FRG you hold — your percentage depends on how much you hold:</p>
-            <table className="payout">
-              <thead><tr><th>Hold at least</th><th>You earn per day</th></tr></thead>
-              <tbody>
-                {stats.rewardTiers.map((t) => (
-                  <tr key={t.minBase}><td>{toWhole(t.minBase)} FRG</td><td>{t.pct}% of your FRG</td></tr>
-                ))}
-              </tbody>
-            </table>
-            <p className="muted">The total paid to ALL holders together is capped at ${stats.dailyCapUsd} worth of FRG per day (worked out at the live price when the payout runs). If one day&apos;s earnings go over the cap, everyone scales down evenly for that day. Wallets registered in the last 24 hours: <strong>{stats.registeredLast24h}</strong>.</p>
+            <p>Every day, ${stats.dailyPayoutUsd} worth of FRG is split between everyone registered, by how much FRG you hold. Your share of the holdings is your share of the reward.</p>
+            <p className="muted">Paste your address once — you&apos;re registered. As long as you hold FRG, you&apos;re in every day&apos;s split. Wallets registered: <strong>{stats.registered}</strong>.</p>
+            <p className="muted">Keep at least {stats.minHoldingWhole} FRG in your wallet — if your balance drops below {stats.minHoldingWhole} FRG, you&apos;re removed from registration and you&apos;ll need to register again.</p>
             {stats.lastPayoutRun && (
               <p className="muted">Last payout: {stats.lastPayoutRun.day} — {stats.lastPayoutRun.totalPaidWhole} {rewardSymbol} paid to {stats.lastPayoutRun.registeredCount} registered wallet(s), status: {stats.lastPayoutRun.status}.</p>
             )}
-            <p className="muted">Program totals: {stats.holders} wallets registered all-time · {toWhole(stats.totalPaid)} {rewardSymbol} paid out so far.</p>
+            <p className="muted">Program totals: {toWhole(stats.totalPaid)} {rewardSymbol} paid out so far.</p>
           </>
         ) : <p className="muted">Loading program details…</p>}
       </div>
@@ -317,10 +302,10 @@ export default function App() {
         <h2>🌠 How it works</h2>
         <ol>
           <li>Hold FRG in your own wallet — it never moves.</li>
-          <li>Paste your wallet address above. That registers you — no wallet connect, no signing, ever.</li>
-          <li>Stay registered: your paste counts for payouts run within 24 hours of it. Paste again any time to refresh.</li>
-          <li>Every day, you earn a set percentage of the FRG you hold (see the table above — bigger holdings, bigger percentage).</li>
-          <li>At the end of the day the payout is sent to you automatically. The pool only pays what is owed — it never empties just because a day ran.</li>
+          <li>Paste your wallet address above once. That registers you for good — no wallet connect, no signing, ever.</li>
+          <li>Keep at least {stats ? stats.minHoldingWhole : '…'} FRG in your wallet. If your balance drops below that, you&apos;re removed from registration and you&apos;ll need to paste your address again to rejoin.</li>
+          <li>Every day, the day&apos;s amount is split between all registered wallets by how much FRG each one holds. Your share of the holdings is your share of the reward.</li>
+          <li>The owner reviews the split and presses the payout button — then the payments are sent automatically. The pool only pays the set amount — it never empties just because a day ran.</li>
         </ol>
         <button className="ghost" onClick={loadStats}>🔄 Refresh</button>
       </div>
@@ -334,7 +319,7 @@ export default function App() {
           {adminStats && (
             <div className="adminstats">
               <p>Holders: {adminStats.holders} · Paid out: {toWhole(adminStats.totalPaid)} {adminStats.rewardSymbol || rewardSymbol} · Accrued: {toWhole(adminStats.totalAccrued)} {adminStats.rewardSymbol || rewardSymbol}</p>
-              <p>Registered in the last 24h: {adminStats.registeredLast24h} · Daily cap: ${adminStats.dailyCapUsd} total · Affiliate rate: {adminStats.affiliateRatePercent}%</p>
+              <p>Registered wallets: {adminStats.registered} · Daily payout amount: ${adminStats.dailyPayoutUsd} total · Daily hard limit: {adminStats.dailyLimitWhole} FRG · Minimum holding: {adminStats.minHoldingWhole} FRG · Affiliate rate: {adminStats.affiliateRatePercent}%</p>
               <p>Payout wallet: {adminStats.payoutAddress ? <span className="mono">{adminStats.payoutAddress}</span> : 'not set yet'}
                 {adminStats.payoutBalance !== null && <> · FRG balance: {toWhole(adminStats.payoutBalance)} FRG</>}
                 {adminStats.payoutUstcBalance !== null && adminStats.payoutUstcBalance !== undefined && <> · USTC balance (dormant future option): {toWhole(adminStats.payoutUstcBalance)} USTC</>}
@@ -345,54 +330,52 @@ export default function App() {
                   <p key={m.id}>Currency switch {m.fromSymbol} → {m.toSymbol}: {m.archivedRows} {m.fromSymbol}-denominated accrual rows archived on {new Date(m.migratedAt).toLocaleDateString()} ({m.archivedAmountWhole} {m.fromSymbol} gross, {m.archivedUnpaidAmountWhole} {m.fromSymbol} unpaid) — archived only, not payable as {m.toSymbol}. The daily pool was reset to 0 at the switch.</p>
                 ))}
               {adminStats.lastPayoutRun && (
-                <p>Last payout run: {adminStats.lastPayoutRun.day} · status {adminStats.lastPayoutRun.status} · paid {adminStats.lastPayoutRun.totalPaidWhole} {rewardSymbol} · {adminStats.lastPayoutRun.registeredCount} registered in window</p>
+                <p>Last payout run: {adminStats.lastPayoutRun.day} · status {adminStats.lastPayoutRun.status} · paid {adminStats.lastPayoutRun.totalPaidWhole} {rewardSymbol} · {adminStats.lastPayoutRun.registeredCount} registered</p>
               )}
             </div>
           )}
 
-          <h2>📊 Tier table</h2>
-          <p className="muted">Each row: hold at least X FRG → earn Y% of holdings per day. The first row starts at 0 so every holder has a tier. Changing tiers never changes a day that already paid.</p>
-          {tierRows.map((r, i) => (
-            <div key={i}>
-              <input type="number" min="0" step="any" placeholder="Hold at least (FRG)" value={r.minWhole}
-                onChange={(e) => setTierRows(tierRows.map((x, j) => (j === i ? { ...x, minWhole: e.target.value } : x)))} />
-              <input type="number" min="0" max="100" step="any" placeholder="% per day" value={r.pct}
-                onChange={(e) => setTierRows(tierRows.map((x, j) => (j === i ? { ...x, pct: e.target.value } : x)))} />
-            </div>
-          ))}
-          <button className="ghost" onClick={() => setTierRows([...tierRows, { minWhole: '', pct: '' }])}>+ Add tier</button>
-          <button className="cyan" onClick={saveTiers}>Save tier table</button>
+          <h2>💰 The day&apos;s two numbers + the holding rule</h2>
+          <p className="muted">Two separate numbers — they are never merged. Changing any of these never changes a day that already paid.</p>
+          <label className="muted" htmlFor="payout-input">Daily payout amount (USD) — the specific amount split between all registered holders that day; converted to FRG at the live price when the payout runs. 0 = nothing pays.</label>
+          <input id="payout-input" type="number" min="0" step="any" placeholder="e.g. 0.50" value={payoutInput} onChange={(e) => setPayoutInput(e.target.value)} />
+          <button className="cyan" onClick={() => payoutInput !== '' && doAdmin('Daily payout amount set', () => adminSetPayoutAmount(adminSecret, address, Number(payoutInput)))}>Set daily payout amount</button>
 
-          <label className="muted" htmlFor="cap-input">Daily cap (USD) — the most ALL holders together can be paid per day; converted to FRG at the live price when the payout runs. 0 = no cap.</label>
-          <input id="cap-input" type="number" min="0" step="any" placeholder="e.g. 0.50" value={capInput} onChange={(e) => setCapInput(e.target.value)} />
-          <button className="cyan" onClick={() => capInput !== '' && doAdmin('Daily cap set', () => adminSetCap(adminSecret, address, Number(capInput)))}>Set daily cap</button>
+          <label className="muted" htmlFor="limit-input">Daily hard limit (FRG) — never pays more than this. An absolute ceiling only, not the amount and not a target.</label>
+          <input id="limit-input" type="number" min="0" step="any" placeholder="e.g. 2000" value={limitInput} onChange={(e) => setLimitInput(e.target.value)} />
+          <button className="cyan" onClick={() => limitInput !== '' && doAdmin('Daily hard limit set', () => adminSetLimit(adminSecret, address, limitInput))}>Set daily hard limit</button>
+
+          <label className="muted" htmlFor="minholding-input">Minimum holding (FRG) — a registered wallet below this at a payout build is REMOVED from registration (it rejoins only by pasting again). ⚠️ The shipped 100 FRG is a PLACEHOLDER — set your real number here.</label>
+          <input id="minholding-input" type="number" min="0" step="any" placeholder="e.g. 100" value={minHoldingInput} onChange={(e) => setMinHoldingInput(e.target.value)} />
+          <button className="cyan" onClick={() => minHoldingInput !== '' && doAdmin('Minimum holding set', () => adminSetMinHolding(adminSecret, address, minHoldingInput))}>Set minimum holding</button>
 
           <label className="muted" htmlFor="rate-input">Affiliate rate (%) — proposed default, pending confirmation</label>
           <input id="rate-input" type="number" min="0" max="100" step="any" placeholder="e.g. 10" value={rateInput} onChange={(e) => setRateInput(e.target.value)} />
           <button className="cyan" onClick={() => rateInput && doAdmin('Affiliate rate set', () => adminSetRate(adminSecret, address, rateInput))}>Set affiliate rate</button>
 
           <h2>💸 Daily payout</h2>
-          <p className="muted">Review the table first — nothing sends until you press the payout button. The table shows every wallet registered in the last 24 hours, what it holds, its tier, what it is owed, and what it will be paid after the cap.</p>
+          <p className="muted">Review the table first — nothing sends until you press the payout button. The table shows every registered wallet, what it holds, its share, and what it will be paid. Loading the preview also applies the minimum-holding rule: wallets below {preview?.minHoldingWhole ?? '…'} FRG are removed from registration and listed under the table.</p>
           <button className="cyan" disabled={previewBusy} onClick={loadPreview}>{previewBusy ? 'Loading…' : '👁 Load payout preview'}</button>
           {preview && (
             <div className="adminstats">
-              <p>Registered in window: <strong>{preview.registeredCount}</strong> · Total owed: {preview.totalOwedWhole} {rewardSymbol}
-                {preview.scaledToCap && <> · Over the cap — scaled to exactly {preview.capWhole} {rewardSymbol} (${preview.dailyCapUsd} at {preview.priceFrgUsd ? `$${preview.priceFrgUsd}` : 'live price'} per FRG)</>}
+              <p>Registered: <strong>{preview.registeredCount}</strong> · Pot: {preview.potWhole} {rewardSymbol} (daily payout amount ${preview.dailyPayoutUsd} at {preview.priceFrgUsd ? `$${preview.priceFrgUsd}` : 'live price'} per FRG · hard limit {preview.limitWhole} {rewardSymbol})
                 {' · '}Pool balance: {preview.poolBalanceWhole} {rewardSymbol} · Pool keeps after payout: {preview.poolRemainderWhole} {rewardSymbol}</p>
               <table className="payout">
-                <thead><tr><th>Wallet</th><th>Holds</th><th>Tier</th><th>Owed</th><th>Will be paid</th></tr></thead>
+                <thead><tr><th>Wallet</th><th>Holds</th><th>Share</th><th>Will be paid</th></tr></thead>
                 <tbody>
                   {preview.rows.map((r) => (
                     <tr key={r.wallet}>
                       <td className="addr">{shortAddr(r.wallet)}</td>
                       <td>{r.balanceWhole}</td>
-                      <td>{r.pct}%</td>
-                      <td>{r.owedWhole}</td>
-                      <td>{r.scaledWhole}</td>
+                      <td>{r.sharePct}%</td>
+                      <td>{r.amountWhole}</td>
                     </tr>
                   ))}
                 </tbody>
               </table>
+              {preview.deregistered?.length > 0 && (
+                <p className="warn">Removed from registration at this build (below the {preview.minHoldingWhole} FRG minimum): {preview.deregistered.map((d) => `${shortAddr(d.wallet)} (${d.balanceWhole} FRG)`).join(', ')}</p>
+              )}
             </div>
           )}
           <button className="glow" disabled={payoutBusy} onClick={pressPayout}>
@@ -400,11 +383,14 @@ export default function App() {
           </button>
           {lastRun && (
             <div className="adminstats">
-              <p>Run {lastRun.day}: <strong>{lastRun.status}</strong> · paid {lastRun.totalPaidWhole} {rewardSymbol} · owed {lastRun.totalOwedWhole} {rewardSymbol}
+              <p>Run {lastRun.day}: <strong>{lastRun.status}</strong> · paid {lastRun.totalPaidWhole} {rewardSymbol} · split {lastRun.totalSplitWhole} {rewardSymbol}
                 {Number(lastRun.shortfall) > 0 && <> · shortfall {toWhole(lastRun.shortfall)} {rewardSymbol} (stays owed)</>}
-                {' · '}{lastRun.registeredCount} registered in window</p>
+                {' · '}{lastRun.registeredCount} registered</p>
+              {lastRun.detail?.deregistered?.length > 0 && (
+                <p className="warn">Removed from registration at this run (below the minimum holding): {lastRun.detail.deregistered.map((d) => shortAddr(d.wallet)).join(', ')}</p>
+              )}
               {lastRun.detail?.rows?.map((r) => (
-                <p key={r.wallet} className="mono">{shortAddr(r.wallet)}: owed {toWhole(r.owed)} → sent {toWhole(r.sent)} ({r.payStatus}){r.txhash && <> · <a href={`${FINDER}/tx/${r.txhash}`} target="_blank" rel="noreferrer">tx</a></>}</p>
+                <p key={r.wallet} className="mono">{shortAddr(r.wallet)}: share {toWhole(r.amount)} → sent {toWhole(r.sent)} ({r.payStatus}){r.txhash && <> · <a href={`${FINDER}/tx/${r.txhash}`} target="_blank" rel="noreferrer">tx</a></>}</p>
               ))}
             </div>
           )}

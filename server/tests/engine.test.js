@@ -1,11 +1,11 @@
-// Engine tests: reward-asset descriptors, the tier table (owed =
-// tier % x own balance, exact boundaries), cap scaling, affiliate
+// Engine tests: reward-asset descriptors, the simple split
+// (pro-rata by holdings, exact pot sum), limit scaling, affiliate
 // bonus, parsing.
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  computeOwed, computeBonuses, scaleAmountsToLimit, normalizeTiers,
-  tierForBalance, MIN_PAYOUT_BASE,
+  computeSplit, computeDay, computeBonuses, scaleAmountsToLimit,
+  MIN_PAYOUT_BASE,
   parseWholeToBase, formatBaseToWhole, isValidTerraAddress,
   HELD_TOKEN_SYMBOL,
 } from '../src/engine.js';
@@ -34,46 +34,58 @@ test('asset descriptors: FRG is held; FRG (CW20) is the live reward; USTC stays 
   assert.equal(rewardAssetFor(undefined), REWARD_ASSETS.FRG); // safe default
 });
 
-// The owner's example tiers (placeholders in his try-out brief):
-// base from 0 FRG at 0.05%/day, mid from 10,000 at 0.1%, top from
-// 100,000 at 0.2%.
-const EXAMPLE_TIERS = [
-  { minBase: 0n, pctBps: 5 },
-  { minBase: 10_000n * FRG1, pctBps: 10 },
-  { minBase: 100_000n * FRG1, pctBps: 20 },
-];
-
-test('owed = tier percentage x own balance, exact per tier', () => {
-  const rows = computeOwed([
-    { wallet: A, balance: 5_000n * FRG1 },   // base tier 0.05%
-    { wallet: B, balance: 50_000n * FRG1 },  // mid tier 0.1%
-    { wallet: C, balance: 200_000n * FRG1 }, // top tier 0.2%
-  ], EXAMPLE_TIERS);
-  assert.equal(rows[0].owed, 2_500_000n);   // 2.5 FRG
-  assert.equal(rows[1].owed, 50_000_000n);  // 50 FRG
-  assert.equal(rows[2].owed, 400_000_000n); // 400 FRG
+test('simple split: proportional to balance (not headcount), sums EXACTLY to the pot', () => {
+  const rows = computeSplit([
+    { wallet: A, balance: 1_000n * FRG1 },
+    { wallet: B, balance: 3_000n * FRG1 },
+  ], 100n * FRG1);
+  assert.equal(rows[0].amount, 25n * FRG1); // 1/4 of the holdings -> 1/4 of the pot
+  assert.equal(rows[1].amount, 75n * FRG1);
+  assert.equal(rows.reduce((s, r) => s + r.amount, 0n), 100n * FRG1);
 });
 
-test('tier selection at exact boundaries: balance AT a minimum gets that tier', () => {
-  assert.equal(tierForBalance(10_000n * FRG1, EXAMPLE_TIERS).pctBps, 10);
-  assert.equal(tierForBalance(10_000n * FRG1 - 1n, EXAMPLE_TIERS).pctBps, 5);
-  assert.equal(tierForBalance(100_000n * FRG1, EXAMPLE_TIERS).pctBps, 20);
-  assert.equal(tierForBalance(0n, EXAMPLE_TIERS).pctBps, 5); // base tier (min 0) covers everyone
+test('simple split: three equal holders, dust goes to the largest holder and the sum is exact', () => {
+  const rows = computeSplit([
+    { wallet: A, balance: 1n }, { wallet: B, balance: 1n }, { wallet: C, balance: 1n },
+  ], 10n);
+  assert.deepEqual(rows.map((r) => r.amount), [4n, 3n, 3n]); // 3+3+3=9 floored, dust 1 to the first (tied-largest)
+  assert.equal(rows.reduce((s, r) => s + r.amount, 0n), 10n);
 });
 
-test('a 1-token holder is owed dust only (its own % of 1 FRG)', () => {
-  const rows = computeOwed([{ wallet: A, balance: 1n * FRG1 }], EXAMPLE_TIERS);
-  assert.equal(rows[0].owed, 500n); // 0.05% of 1 FRG — dust, far below the 1 FRG send threshold
-  assert.ok(rows[0].owed < MIN_PAYOUT_BASE);
+test('simple split: a 1-token holder among large holders gets a dust share, not the pot', () => {
+  const pot = 1_174n * FRG1;
+  const rows = computeSplit([
+    { wallet: A, balance: 1n * FRG1 },        // holds exactly 1 FRG
+    { wallet: B, balance: 999_999n * FRG1 },  // holds the rest
+  ], pot);
+  assert.equal(rows[0].amount, 1_174n); // its 1/1,000,000 share — dust, below the send threshold
+  assert.ok(rows[0].amount < MIN_PAYOUT_BASE);
+  assert.equal(rows[0].amount + rows[1].amount, pot); // still exact
 });
 
-test('no tiers configured: only the base tier at 0% — owed is 0 (program off)', () => {
-  const rows = computeOwed([{ wallet: A, balance: 1_000_000n * FRG1 }], []);
-  assert.equal(rows[0].pctBps, 0);
-  assert.equal(rows[0].owed, 0n);
-  const table = normalizeTiers([]);
-  assert.equal(table.length, 1);
-  assert.equal(table[0].minBase, 0n);
+test('simple split: a sole registrant receives the full pot', () => {
+  const rows = computeSplit([{ wallet: A, balance: 42n * FRG1 }], 10n * FRG1);
+  assert.equal(rows[0].amount, 10n * FRG1);
+});
+
+test('simple split: zero-balance registrant gets 0; pot 0 or no holdings pays nothing', () => {
+  const rows = computeSplit([
+    { wallet: A, balance: 0n }, { wallet: B, balance: 100n * FRG1 },
+  ], 10n * FRG1);
+  assert.equal(rows[0].amount, 0n);
+  assert.equal(rows[1].amount, 10n * FRG1); // the whole pot follows the holdings
+  const zero = computeSplit([{ wallet: A, balance: 100n * FRG1 }], 0n);
+  assert.equal(zero[0].amount, 0n);
+  const noHoldings = computeSplit([{ wallet: A, balance: 0n }], 10n * FRG1);
+  assert.equal(noHoldings[0].amount, 0n);
+});
+
+test('computeDay: shares are the split; the referral bonus is computed on shares, extra', () => {
+  const { shares, bonuses } = computeDay(
+    [{ wallet: A, balance: 1_000n }, { wallet: B, balance: 1_000n }],
+    1_000n, new Map([[B, A]]), 1000);
+  assert.equal(shares.find((s) => s.wallet === B).amount, 500n);
+  assert.equal(bonuses.find((b) => b.wallet === A).amount, 50n);
 });
 
 test('scale-to-limit: exact sum at the limit, proportional, untouched when under', () => {
@@ -84,7 +96,7 @@ test('scale-to-limit: exact sum at the limit, proportional, untouched when under
   assert.equal(scaled.reduce((s, r) => s + r.amount, 0n), 250n); // exactly the limit
   assert.deepEqual(scaled.map((r) => r.amount), [150n, 50n, 50n]);
   const under = scaleAmountsToLimit(rows, 1_000n);
-  assert.deepEqual(under.map((r) => r.amount), [300n, 100n, 100n]); // cap is a max, not a target
+  assert.deepEqual(under.map((r) => r.amount), [300n, 100n, 100n]); // limit is a max, not a target
 });
 
 test('affiliate bonus is extra, never deducted from the referral', () => {
