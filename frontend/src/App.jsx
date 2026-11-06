@@ -8,6 +8,18 @@ import {
   getNft, collectNftBonus, getAdminNft, adminSetNftSettings, adminFundBonusPool,
 } from './lib/api.js';
 
+// Every deadline shown anywhere on this page is rendered in US
+// Eastern Time with the zone named, so the printed time always
+// matches the announced cutoff (e.g. "8:00 AM ET"). Local device
+// time is never used for deadline displays — a visitor in another
+// timezone would otherwise see a different hour than the cutoff
+// the owner announced.
+const fmtET = (ms) => new Date(ms).toLocaleString('en-US', {
+  timeZone: 'America/New_York',
+  month: 'numeric', day: 'numeric', year: 'numeric',
+  hour: 'numeric', minute: '2-digit', second: '2-digit', hour12: true,
+}) + ' ET';
+
 const fmtCountdown = (totalSeconds) => {
   const s = Math.max(0, Math.floor(totalSeconds));
   const p = (n) => String(n).padStart(2, '0');
@@ -234,7 +246,7 @@ export default function App() {
             <h2>⏰ Time&apos;s up — wallets are locked in for this split.<span className="clock done">00:00:00</span></h2>
           )}
           <p>You must get your wallet address in before the timer runs out to be in this split. Registering is one-time — miss this split and you&apos;re in the next one.</p>
-          <p className="muted">Split deadline: {new Date(stats.splitDeadlineMs).toLocaleString()}</p>
+          <p className="muted">Split deadline: {fmtET(stats.splitDeadlineMs)}</p>
         </div>
       ) : null}
 
@@ -354,7 +366,7 @@ export default function App() {
               <p>Holders: {adminStats.holders} · Paid out: {toWhole(adminStats.totalPaid)} {adminStats.rewardSymbol || rewardSymbol} · Accrued: {toWhole(adminStats.totalAccrued)} {adminStats.rewardSymbol || rewardSymbol}</p>
               <p>Registered wallets: {adminStats.registered} · Daily payout amount: ${adminStats.dailyPayoutUsd} total · Daily hard limit: {adminStats.dailyLimitWhole} FRG · Minimum holding: {adminStats.minHoldingWhole} FRG · Affiliate rate: {adminStats.affiliateRatePercent}%</p>
               <p>Split timer: {adminStats.splitDeadlineMs
-                ? <>⏰ deadline {new Date(adminStats.splitDeadlineMs).toLocaleString()} ({adminStats.secondsRemaining > 0 ? `${fmtCountdown(adminStats.secondsRemaining)} left when this panel loaded` : 'time is up — the cutoff applies at the next build'})</>
+                ? <>⏰ deadline {fmtET(adminStats.splitDeadlineMs)} ({adminStats.secondsRemaining > 0 ? `${fmtCountdown(adminStats.secondsRemaining)} left when this panel loaded` : 'time is up — the cutoff applies at the next build'})</>
                 : 'not set — the page shows no clock and every registered wallet is counted.'}</p>
               <p>Payout wallet: {adminStats.payoutAddress ? <span className="mono">{adminStats.payoutAddress}</span> : 'not set yet'}
                 {adminStats.payoutBalance !== null && <> · FRG balance: {toWhole(adminStats.payoutBalance)} FRG</>}
@@ -410,7 +422,7 @@ export default function App() {
               <p>Registered: <strong>{preview.registeredCount}</strong> · Pot: {preview.potWhole} {rewardSymbol} (daily payout amount ${preview.dailyPayoutUsd} at {preview.priceFrgUsd ? `$${preview.priceFrgUsd}` : 'live price'} per FRG · hard limit {preview.limitWhole} {rewardSymbol})
                 {' · '}Pool balance: {preview.poolBalanceWhole} {rewardSymbol} · Pool keeps after payout: {preview.poolRemainderWhole} {rewardSymbol}</p>
               {preview.splitDeadlineMs ? (
-                <p>⏰ Timer cutoff used: wallets registered by <strong>{new Date(preview.splitDeadlineMs).toLocaleString()}</strong> — <strong>{preview.registeredBeforeCutoff}</strong> in before it · <strong>{preview.registeredAfterCutoff}</strong> after it (they stay registered and wait for the next split).
+                <p>⏰ Timer cutoff used: wallets registered by <strong>{fmtET(preview.splitDeadlineMs)}</strong> — <strong>{preview.registeredBeforeCutoff}</strong> in before it · <strong>{preview.registeredAfterCutoff}</strong> after it (they stay registered and wait for the next split).
                   {preview.lateRegistrations?.length > 0 && <> After the cutoff: {preview.lateRegistrations.map((w) => shortAddr(w)).join(', ')}</>}</p>
               ) : (
                 <p className="muted">No split timer set — this preview counted every registered wallet.</p>
@@ -445,7 +457,7 @@ export default function App() {
                 <p className="warn">Removed from registration at this run (below the minimum holding): {lastRun.detail.deregistered.map((d) => shortAddr(d.wallet)).join(', ')}</p>
               )}
               {lastRun.detail?.splitDeadlineMs && (
-                <p className="muted">⏰ This run used the timer cutoff {new Date(lastRun.detail.splitDeadlineMs).toLocaleString()} — {lastRun.detail.registeredAfterCutoff ?? 0} wallet(s) registered after it and waited for the next split.</p>
+                <p className="muted">⏰ This run used the timer cutoff {fmtET(lastRun.detail.splitDeadlineMs)} — {lastRun.detail.registeredAfterCutoff ?? 0} wallet(s) registered after it and waited for the next split.</p>
               )}
               {lastRun.detail?.rows?.map((r) => (
                 <p key={r.wallet} className="mono">{shortAddr(r.wallet)}: share {toWhole(r.amount)} → sent {toWhole(r.sent)} ({r.payStatus}){r.txhash && <> · <a href={`${FINDER}/tx/${r.txhash}`} target="_blank" rel="noreferrer">tx</a></>}</p>
