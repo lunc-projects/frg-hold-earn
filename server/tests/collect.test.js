@@ -9,7 +9,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { openStore } from '../src/store.js';
-import { createApp, runSnapshot } from '../src/server.js';
+import { createApp } from '../src/server.js';
 import { FRG_TOKEN } from '../src/assets.js';
 
 const A = 'terra1' + 'a'.repeat(38); // holder
@@ -73,18 +73,20 @@ const post = (base, p, body, headers = {}) => fetch(`${base}${p}`, {
 const get = (base, p, headers = {}) => fetch(`${base}${p}`, { headers })
   .then(async (r) => ({ status: r.status, body: await r.json() }));
 
-// Seed: A holds 1 FRG (1,000,000 base units) on day 1, referred by B,
-// and A REGISTERED for day 1's round. Pot model: the 1,000,000 pot
-// empties to the day's registrants pro-rata — A is the only one, so
-// A earns the whole 1,000,000; B earns the 10% referral bonus.
+// Seed: a recorded day (as a payout run would leave it) where A
+// was owed 1 FRG (1,000,000 base units) and B, A's referrer, earned
+// the 10% referral bonus (100,000). Recorded directly through the
+// store — Collect is what is under test here, not the payout run
+// (payout.test.js covers that end to end).
 async function seeded() {
   const payout = fakePayout();
   const ctx = await startApp({ payout });
   const { store } = ctx;
   store.registerWallet(A, B);
-  store.registerForDay('2026-10-24', A);
-  store.setDailyPool(1_000_000n);
-  await runSnapshot(store, async () => 1_000_000n, '2026-10-24');
+  store.recordDay('2026-10-24', 1_000_000n,
+    [{ wallet: A, balance: 1_000_000n }],
+    [{ wallet: A, amount: 1_000_000n }],
+    [{ wallet: B, amount: 100_000n }]);
   return { ...ctx, payout };
 }
 
@@ -127,9 +129,10 @@ test('insufficient FRG reward balance fails safely, nothing marked paid', async 
   const ctx = await startApp({ payout });
   t.after(() => { ctx.server.closeAllConnections(); ctx.server.close(); });
   ctx.store.registerWallet(A, B);
-  ctx.store.registerForDay('2026-10-24', A);
-  ctx.store.setDailyPool(1_000_000n);
-  await runSnapshot(ctx.store, async () => 1_000_000n, '2026-10-24');
+  ctx.store.recordDay('2026-10-24', 1_000_000n,
+    [{ wallet: A, balance: 1_000_000n }],
+    [{ wallet: A, amount: 1_000_000n }],
+    [{ wallet: B, amount: 100_000n }]);
   const c = await post(ctx.base, '/api/collect', { address: A });
   assert.equal(c.status, 400);
   assert.match(c.body.error, /rewards pool empty, top up/);
@@ -143,9 +146,10 @@ test('payout not configured fails safely', async (t) => {
   const ctx = await startApp({ payout: fakePayout({ configured: false }) });
   t.after(() => { ctx.server.closeAllConnections(); ctx.server.close(); });
   ctx.store.registerWallet(A, B);
-  ctx.store.registerForDay('2026-10-24', A);
-  ctx.store.setDailyPool(1_000_000n);
-  await runSnapshot(ctx.store, async () => 1_000_000n, '2026-10-24');
+  ctx.store.recordDay('2026-10-24', 1_000_000n,
+    [{ wallet: A, balance: 1_000_000n }],
+    [{ wallet: A, amount: 1_000_000n }],
+    [{ wallet: B, amount: 100_000n }]);
   const c = await post(ctx.base, '/api/collect', { address: A });
   assert.equal(c.status, 503);
   assert.match(c.body.error, /payout wallet not configured yet/);
@@ -192,15 +196,22 @@ test('admin gating: wrong wallet/secret refused, correct pair works', async (t) 
   assert.equal(ok.body.rewardMigrations.length, 2); // #1 FRG->USTC, then #2 USTC->FRG
   assert.equal(ok.body.rewardMigrations[1].fromSymbol, 'USTC');
   assert.equal(ok.body.rewardMigrations[1].toSymbol, 'FRG');
-  const setPool = await post(base, '/api/admin/pool', { poolWhole: '5000' },
+  const setTiers = await post(base, '/api/admin/tiers',
+    { tiers: [{ minWhole: '0', pct: 0.05 }, { minWhole: '10000', pct: 0.1 }] },
     { 'x-admin-wallet': ADMIN, 'x-admin-secret': SECRET });
-  assert.equal(setPool.status, 200);
-  assert.equal(setPool.body.dailyPool, '5000000000'); // 5,000 FRG daily pot, base units
-  assert.equal(setPool.body.dailyPot, '5000000000');
-  assert.equal(setPool.body.rewardDenom, FRG_TOKEN);
-  const setPoolBad = await post(base, '/api/admin/pool', { poolWhole: '5000' },
+  assert.equal(setTiers.status, 200);
+  assert.equal(setTiers.body.rewardTiers.length, 2);
+  assert.equal(setTiers.body.rewardTiers[1].minWhole, '10000');
+  assert.equal(setTiers.body.rewardTiers[1].pct, 0.1);
+  assert.equal(setTiers.body.rewardDenom, FRG_TOKEN);
+  const setTiersBad = await post(base, '/api/admin/tiers',
+    { tiers: [{ minWhole: '0', pct: 0.05 }] },
     { 'x-admin-wallet': ADMIN, 'x-admin-secret': 'nope' });
-  assert.equal(setPoolBad.status, 403);
+  assert.equal(setTiersBad.status, 403);
+  const setCap = await post(base, '/api/admin/cap', { capUsd: 0.5 },
+    { 'x-admin-wallet': ADMIN, 'x-admin-secret': SECRET });
+  assert.equal(setCap.status, 200);
+  assert.equal(setCap.body.dailyCapUsd, 0.5);
   const setRate = await post(base, '/api/admin/rate', { percent: 15 },
     { 'x-admin-wallet': ADMIN, 'x-admin-secret': SECRET });
   assert.equal(setRate.status, 200);
@@ -214,37 +225,38 @@ test('admin endpoints refuse outright when no secret is configured', async (t) =
   assert.equal(r.status, 503);
 });
 
-test('public stats denominate the pot and totals in FRG', async (t) => {
+test('public stats show the tier table + cap in FRG terms', async (t) => {
   const { server, base, store } = await startApp();
   t.after(() => { server.closeAllConnections(); server.close(); });
-  store.setDailyPool(2_500_000n); // 2.5 FRG daily pot
+  store.setRewardTiers([{ minBase: 0n, pctBps: 5 }]);
   const s = await get(base, '/api/stats');
   assert.equal(s.status, 200);
-  assert.equal(s.body.dailyPool, '2500000');
-  assert.equal(s.body.dailyPoolWhole, '2.5');
-  assert.equal(s.body.dailyPot, '2500000');
-  assert.equal(s.body.dailyPotWhole, '2.5');
-  assert.equal(s.body.registeredToday, 0);
+  assert.equal(s.body.rewardTiers.length, 1);
+  assert.equal(s.body.rewardTiers[0].pct, 0.05);
+  assert.equal(s.body.dailyCapUsd, 0.5); // owner's cap ships as the default
+  assert.equal(s.body.registeredLast24h, 0);
   assert.equal(s.body.rewardDenom, FRG_TOKEN);
   assert.equal(s.body.rewardSymbol, 'FRG');
   assert.equal(s.body.heldTokenSymbol, 'FRG');
 });
 
-test("registering enters the wallet in today's round; rewards report it", async (t) => {
+test('paste-register puts the wallet in the rolling 24h window; rewards report it', async (t) => {
   const { server, base } = await startApp();
   t.after(() => { server.closeAllConnections(); server.close(); });
   const before = await get(base, `/api/rewards?address=${A}`);
-  assert.equal(before.body.registeredToday, false);
+  assert.equal(before.body.registeredInWindow, false);
   const r = await post(base, '/api/register', { address: A, referrer: null });
   assert.equal(r.status, 200);
-  assert.equal(r.body.registeredForDay, true);
-  assert.equal(r.body.day, new Date().toISOString().slice(0, 10)); // the app's UTC day
+  assert.equal(r.body.windowHours, 24);
+  assert.ok(r.body.registeredAt > 0);
   const after = await get(base, `/api/rewards?address=${A}`);
-  assert.equal(after.body.registeredToday, true);
-  const again = await post(base, '/api/register', { address: A, referrer: null });
-  assert.equal(again.body.alreadyRegisteredToday, true); // same day: still one entry
+  assert.equal(after.body.registeredInWindow, true);
   const s = await get(base, '/api/stats');
-  assert.equal(s.body.registeredToday, 1);
+  assert.equal(s.body.registeredLast24h, 1);
+  // Paste-register rejects invalid addresses with a plain error.
+  const badAddr = await post(base, '/api/register', { address: 'not-a-wallet', referrer: null });
+  assert.equal(badAddr.status, 400);
+  assert.match(badAddr.body.error, /invalid Terra address/);
 });
 
 test('referral bonus accrues to the referrer, collectable by them', async (t) => {

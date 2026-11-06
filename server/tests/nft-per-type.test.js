@@ -213,7 +213,7 @@ test("snapshot: #102 reads common:1 and accrues 50 FRG/day; excluded 69-NFT wall
     assert.equal(store.latestNftCount(M), 6);
     assert.equal(store.nftAccrued(M), 358_000_000n);
 
-    assert.deepEqual(store.snapshotDays(), ['2026-10-29']); // base side ran
+    assert.deepEqual(store.snapshotDays(), []); // base days come from payout runs only
   } finally { global.fetch = realFetch; }
 });
 
@@ -231,7 +231,7 @@ test('snapshot: an nft_info failure skips the whole NFT day; base completes; ret
     out = await runSnapshot(store, async () => 1_000_000n, '2026-10-29', fetchNftCounts);
   } finally { global.fetch = realFetch; }
   assert.equal(out.nft.skipped, true);
-  assert.deepEqual(store.snapshotDays(), ['2026-10-29']); // base completed
+  assert.deepEqual(store.snapshotDays(), []); // base is payout-run-only; the NFT skip is the point here
   assert.deepEqual(store.nftSnapshotDays(), []); // nothing partial
   assert.equal(store.nftAccrued(S), 0n);
 

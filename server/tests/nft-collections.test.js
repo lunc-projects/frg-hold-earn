@@ -143,9 +143,11 @@ test('snapshot: holdings in 2 collections consolidate; bonus = count x rate exac
     assert.equal(store.nftAccrued(B), 4_000_000n);
     // Base side ran normally alongside (equal balances earn equally;
     // the day's pot splits evenly between the two equal holders).
-    assert.deepEqual(store.snapshotDays(), ['2026-10-28']);
-    assert.equal(store.accrued(A), 500_000n);
-    assert.equal(store.accrued(B), 500_000n);
+    // Base rewards are payout-run-only now (owner's final model):
+    // the NFT snapshot records no base day and accrues no base.
+    assert.deepEqual(store.snapshotDays(), []);
+    assert.equal(store.accrued(A), 0n);
+    assert.equal(store.accrued(B), 0n);
   } finally { global.fetch = realFetch; }
 });
 
@@ -182,8 +184,8 @@ test('snapshot: LCD failure skips the NFT day, base completes, retry lands the N
     out = await runSnapshot(store, async () => 1_000_000n, '2026-10-28', fetchNftCount);
   } finally { global.fetch = realFetch; }
   // Base snapshot completed and paid its share despite the LCD outage.
-  assert.deepEqual(store.snapshotDays(), ['2026-10-28']);
-  assert.equal(store.accrued(A), 1_000_000n);
+  assert.deepEqual(store.snapshotDays(), []); // base days come from payout runs only
+  assert.equal(store.accrued(A), 0n);
   // NFT day skipped as a whole: nothing partial recorded.
   assert.equal(out.nft.skipped, true);
   assert.match(out.nft.error, /NFT bonus snapshot skipped/);
@@ -200,7 +202,7 @@ test('snapshot: LCD failure skips the NFT day, base completes, retry lands the N
   assert.deepEqual(store.nftSnapshotDays(), ['2026-10-28']);
   assert.equal(store.latestNftCount(A), 35);
   assert.equal(store.nftAccrued(A), 70_000_000n);
-  assert.equal(store.accrued(A), 1_000_000n); // still one base day
+  assert.equal(store.accrued(A), 0n); // base unchanged: payout-run-only
 });
 
 // --- Rate unset: counts recorded, zero bonus, honest labels ---

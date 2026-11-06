@@ -1,40 +1,45 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
-import { useChain } from '@cosmos-kit/react';
-import { CHAIN_NAME, ADMIN_ADDRESS, FINDER, FRG, toWhole, shortAddr } from './config.js';
+import { useCallback, useEffect, useState } from 'react';
+import { ADMIN_ADDRESS, FINDER, toWhole, shortAddr } from './config.js';
 import {
-  fetchHoldings, getStats, getRewards, getReferrals, register, collect,
-  getAdmin, adminSetPool, adminSetRate, adminSnapshot,
-  getNft, collectNftBonus, recordMint,
-  getAdminNft, adminSetNftSettings, adminFundBonusPool,
-  fetchNftContractConfig, fetchNftNumTokens,
+  fetchHoldings, getStats, getBalance, getRewards, getReferrals, register,
+  getAdmin, adminSetRate, adminSnapshot, adminSetTiers, adminSetCap,
+  adminPayoutPreview, adminRunPayout,
+  getNft, collectNftBonus, getAdminNft, adminSetNftSettings, adminFundBonusPool,
 } from './lib/api.js';
 
-export default function App() {
-  const chain = useChain(CHAIN_NAME);
-  const connected = chain.status === 'Connected' && chain.address;
-  const address = chain.address || '';
-  // Admin gate follows the BACKEND's admin wallet (from /api/stats),
-  // falling back to the baked-in constant only before stats load — so
-  // the admin wallet can change by server env alone, no app rebuild.
-  const [stats, setStats] = useState(null);
-  const isAdmin = connected && address === (stats?.adminWallet || ADMIN_ADDRESS);
+// FRG Hold & Earn — PASTE-ONLY. There is no wallet connect and no
+// signing anywhere in this app: pasting an address registers it and
+// shows its balance/rewards view. Payouts are sent automatically
+// from the program's payout wallet when the owner runs the daily
+// payout. Any version of this app that asks to connect a wallet or
+// sign anything is a fake.
+const ADDR_RE = /^terra1[023456789acdefghjklmnpqrstuvwxyz]{38}$/;
 
+export default function App() {
+  const [stats, setStats] = useState(null);
+  const [paste, setPaste] = useState('');
+  const [address, setAddress] = useState(''); // the pasted (viewed) wallet
   const [holdings, setHoldings] = useState(null);
   const [rewards, setRewards] = useState(null);
   const [referrals, setReferrals] = useState(null);
   const [nft, setNft] = useState(null);
   const [collectingNft, setCollectingNft] = useState(false);
-  const [minting, setMinting] = useState(false);
   const [log, setLog] = useState('');
-  const [collecting, setCollecting] = useState(false);
-  const [refLink, setRefLink] = useState('');
-  const [registered, setRegistered] = useState(null);
+  const [regBusy, setRegBusy] = useState(false);
+
+  // Admin state (panel shows when the pasted wallet is the admin
+  // wallet; the secret gates every admin call server-side).
+  const isAdmin = address !== '' && address === (stats?.adminWallet || ADMIN_ADDRESS);
   const [adminSecret, setAdminSecret] = useState('');
   const [adminStats, setAdminStats] = useState(null);
   const [adminNft, setAdminNft] = useState(null);
-  const [poolInput, setPoolInput] = useState('');
+  const [tierRows, setTierRows] = useState([]); // [{minWhole, pct}]
+  const [capInput, setCapInput] = useState('');
   const [rateInput, setRateInput] = useState('');
-  const [nftCollectionInput, setNftCollectionInput] = useState('');
+  const [preview, setPreview] = useState(null);
+  const [previewBusy, setPreviewBusy] = useState(false);
+  const [payoutBusy, setPayoutBusy] = useState(false);
+  const [lastRun, setLastRun] = useState(null);
   const [nftCollectionsInput, setNftCollectionsInput] = useState('');
   const [nftExcludedInput, setNftExcludedInput] = useState('');
   const [nftMintInput, setNftMintInput] = useState('');
@@ -46,7 +51,6 @@ export default function App() {
   const [nftPoolWalletInput, setNftPoolWalletInput] = useState('');
   const [nftFundInput, setNftFundInput] = useState('');
   const [nftFundNoteInput, setNftFundNoteInput] = useState('');
-  const autoRegDone = useRef('');
 
   // The reward currency is whatever the API reports (FRG since the
   // 2026-11-05 switch) — the page never hard-codes it.
@@ -54,69 +58,47 @@ export default function App() {
 
   const pushLog = useCallback((m) => setLog((prev) => (prev ? `${prev}\n${m}` : m)), []);
 
-  const refresh = useCallback(async () => {
-    if (!connected) return;
-    // allSettled, not all: one stalled/failed lookup must never wipe the
-    // others or leave the page stuck — each result lands on its own,
-    // and each failure logs visibly instead of hanging refresh.
-    const [h, r, rf, s, n] = await Promise.allSettled([
-      fetchHoldings(address), getRewards(address), getReferrals(address), getStats(), getNft(address),
+  const loadStats = useCallback(async () => {
+    try { setStats(await getStats()); } catch (e) { pushLog(`Stats failed: ${e.message}`); }
+  }, [pushLog]);
+
+  useEffect(() => { loadStats(); }, [loadStats]);
+
+  const refreshViews = useCallback(async (addr) => {
+    const [h, r, rf, n, b] = await Promise.allSettled([
+      fetchHoldings(addr), getRewards(addr), getReferrals(addr), getNft(addr), getBalance(addr),
     ]);
     if (h.status === 'fulfilled') setHoldings(h.value);
+    else if (b.status === 'fulfilled') setHoldings(b.value.balance);
     else pushLog(`Balance lookup failed: ${h.reason?.message || h.reason}`);
     if (r.status === 'fulfilled') setRewards(r.value);
     else pushLog(`Rewards lookup failed: ${r.reason?.message || r.reason}`);
     if (rf.status === 'fulfilled') setReferrals(rf.value);
-    else pushLog(`Referrals lookup failed: ${rf.reason?.message || rf.reason}`);
-    if (s.status === 'fulfilled') setStats(s.value);
-    else pushLog(`Stats lookup failed: ${s.reason?.message || s.reason}`);
     if (n.status === 'fulfilled') setNft(n.value);
-    else pushLog(`NFT lookup failed: ${n.reason?.message || n.reason}`);
-    setRefLink(`${window.location.origin}${window.location.pathname}?ref=${address}`);
-  }, [connected, address, pushLog]);
+  }, [pushLog]);
 
-  // Auto-register on first connect when arriving via a referral link.
-  // First-touch wins server-side: an existing binding never changes.
-  useEffect(() => {
-    if (!connected || autoRegDone.current === address) return;
-    autoRegDone.current = address;
-    const ref = new URLSearchParams(window.location.search).get('ref') || '';
-    register(address, ref && ref !== address ? ref : null)
-      .then((r) => {
-        setRegistered(r);
-        if (r.created && r.referrer) pushLog(`Registered — your referrer is ${shortAddr(r.referrer)}.`);
-      })
-      .catch((e) => pushLog(`Registration failed: ${e.message}`));
-    refresh();
-  }, [connected, address, refresh, pushLog]);
-
-  // The daily Register action: enters this wallet in TODAY's round.
-  // Registration is per-day — it never carries over to tomorrow.
-  // (The first-touch referral binding rides along server-side and
-  // never changes; re-registering only joins today's round.)
-  const doRegisterToday = async () => {
+  // THE door: paste an address -> it registers (or refreshes its
+  // 24h window) and its view loads. Invalid input is a plain error.
+  const doRegister = async () => {
+    const addr = paste.trim();
+    if (!ADDR_RE.test(addr)) {
+      pushLog('That does not look like a Terra address. Paste a full terra1… address and try again.');
+      return;
+    }
+    setRegBusy(true);
     try {
-      const r = await register(address, null);
-      setRegistered(r);
-      pushLog(r.alreadyRegisteredToday
-        ? 'You are already registered for today\'s round.'
-        : '✅ Registered for today\'s round — hold FRG and you share in today\'s pot.');
-      await refresh();
+      const ref = new URLSearchParams(window.location.search).get('ref') || '';
+      const out = await register(addr, ref && ref !== addr ? ref : null);
+      setAddress(addr);
+      pushLog(out.created
+        ? '✅ Registered! Your wallet is now in the 24-hour window for the next payout.'
+        : '✅ Registration refreshed — your wallet is in the 24-hour window for the next payout.');
+      await refreshViews(addr);
+      await loadStats();
     } catch (e) {
       pushLog(`Registration failed: ${e.message}`);
-    }
-  };
-
-  const doCollect = async () => {
-    setCollecting(true);
-    try {
-      const out = await collect(address);
-      pushLog(`✅ Collected ${out.paidWhole} ${out.rewardSymbol || rewardSymbol} — ${FINDER}/tx/${out.txhash}`);
-      await refresh();
-    } catch (e) {
-      pushLog(`Collect failed: ${e.message}`);
     } finally {
-      setCollecting(false);
+      setRegBusy(false);
     }
   };
 
@@ -125,7 +107,7 @@ export default function App() {
     try {
       const out = await collectNftBonus(address);
       pushLog(`✅ Collected ${out.paidWhole} FRG NFT bonus — ${FINDER}/tx/${out.txhash}`);
-      await refresh();
+      await refreshViews(address);
     } catch (e) {
       pushLog(`NFT bonus collect failed: ${e.message}`);
     } finally {
@@ -133,109 +115,82 @@ export default function App() {
     }
   };
 
-  // Real mint, signed by the connected wallet — no simulated mint
-  // anywhere in this app. Steps, all verified before/after signing:
-  // 1. The app reads the collection contract on-chain and refuses to
-  //    sign unless it matches the app settings: same FRG fee token,
-  //    same mint price, fee recipient = bonus pool wallet, not sold out.
-  // 2. The wallet signs a CW20 send of the mint fee to the collection
-  //    with a {mint:{}} message. The contract mints to the sender and
-  //    forwards the fee to the bonus pool wallet.
-  // 3. The app reports ONLY the txhash to the backend, which verifies
-  //    the fee transfer on-chain before crediting the tracked bonus
-  //    pool. If verification fails, the mint itself still happened —
-  //    the log says so honestly instead of claiming a credit.
-  const doMint = async () => {
-    if (!nft?.mintReady) { pushLog('Minting is not ready — see the NFT section.'); return; }
-    setMinting(true);
-    try {
-      const cfg = await fetchNftContractConfig(nft.collection);
-      const num = await fetchNftNumTokens(nft.collection);
-      if (cfg.frg_token !== FRG.address) throw new Error('Collection is not an FRG-fee collection — mint blocked.');
-      if (String(cfg.mint_cost) !== String(nft.mintCost)) throw new Error(`Collection mint price (${cfg.mint_cost}) does not match the app setting (${nft.mintCost}) — mint blocked. Ask the admin to sync them.`);
-      if ((cfg.fee_recipient || '') !== nft.bonusPoolWallet) throw new Error('Collection fee recipient is not the bonus pool wallet — mint blocked. Ask the admin to sync them.');
-      const cap = nft.supplyCap > 0 ? nft.supplyCap : (cfg.max_supply ?? null);
-      if (cap !== null && num >= cap) throw new Error('Sold out — no more NFTs to mint.');
-      const client = await chain.getSigningCosmWasmClient();
-      const res = await client.execute(address, FRG.address,
-        { send: { contract: nft.collection, amount: nft.mintCost, msg: btoa(JSON.stringify({ mint: {} })) } },
-        'auto');
-      pushLog(`✅ Minted — ${FINDER}/tx/${res.transactionHash}`);
-      try {
-        const rec = await recordMint(address, res.transactionHash);
-        pushLog(rec.alreadyRecorded
-          ? 'Bonus pool already credited for this mint.'
-          : `Bonus pool credited +${toWhole(rec.credited)} FRG from your mint fee.`);
-      } catch (e) {
-        pushLog(`Mint is on-chain, but the bonus pool credit could not be verified yet: ${e.message} — ask the admin to record it.`);
-      }
-      await refresh();
-    } catch (e) {
-      pushLog(`Mint failed: ${e.message}`);
-    } finally {
-      setMinting(false);
-    }
-  };
-
+  // --- Admin helpers ---
   const doAdmin = async (label, fn) => {
     try {
       const out = await fn();
-      setAdminStats(out);
-      pushLog(`${label} ✅`);
-      await refresh();
+      pushLog(`✅ ${label}`);
+      return out;
     } catch (e) {
       pushLog(`${label} failed: ${e.message}`);
+      return null;
     }
   };
 
   const loadAdmin = async () => {
-    if (!adminSecret) { pushLog('Enter the admin secret first.'); return; }
-    await doAdmin('Admin stats', () => getAdmin(adminSecret, address));
-  };
-
-  const loadAdminNft = async () => {
-    if (!adminSecret) { pushLog('Enter the admin secret first.'); return; }
-    try {
-      const out = await getAdminNft(adminSecret, address);
-      setAdminNft(out);
-      setNftCollectionsInput((out.collections || []).join('\n'));
-      setNftExcludedInput((out.excludedWallets || []).join('\n'));
-      pushLog('NFT admin stats ✅');
-    } catch (e) {
-      pushLog(`NFT admin stats failed: ${e.message}`);
+    const out = await doAdmin('Admin stats loaded', () => getAdmin(adminSecret, address));
+    if (out) {
+      setAdminStats(out);
+      setTierRows((out.rewardTiers || []).map((t) => ({ minWhole: t.minWhole, pct: String(t.pct) })));
+      setCapInput(String(out.dailyCapUsd ?? ''));
     }
   };
 
-  // Bonus collections are saved as a complete list (one address per
-  // line): whatever is in the box REPLACES the list, so an empty box
-  // deliberately disconnects all bonus collections. This is separate
-  // from the blank-means-unchanged fields above.
-  const saveBonusCollections = async () => {
-    const list = nftCollectionsInput.split(/[\s,]+/).map((s) => s.trim()).filter(Boolean);
-    await doAdmin('Bonus collections saved', () => adminSetNftSettings(adminSecret, address, { collections: list }));
-    await loadAdminNft();
+  const loadAdminNft = async () => {
+    const out = await doAdmin('NFT admin stats loaded', () => getAdminNft(adminSecret, address));
+    if (out) setAdminNft(out);
   };
 
-  // Excluded wallets are saved the same way: the box REPLACES the
-  // whole list, so an empty box clears all exclusions. Excluded
-  // wallets record an NFT count of 0 and never accrue NFT bonus;
-  // their base hold-and-earn rewards are unaffected.
-  const saveExcludedWallets = async () => {
-    const list = nftExcludedInput.split(/[\s,]+/).map((s) => s.trim()).filter(Boolean);
-    await doAdmin('Excluded wallets saved', () => adminSetNftSettings(adminSecret, address, { excludedWallets: list }));
-    await loadAdminNft();
+  const saveTiers = async () => {
+    const tiers = tierRows
+      .filter((r) => r.minWhole !== '' && r.pct !== '')
+      .map((r) => ({ minWhole: r.minWhole, pct: Number(r.pct) }));
+    const out = await doAdmin('Tier table saved', () => adminSetTiers(adminSecret, address, tiers));
+    if (out) {
+      setTierRows((out.rewardTiers || []).map((t) => ({ minWhole: t.minWhole, pct: String(t.pct) })));
+      await loadStats();
+    }
   };
 
-  // Save only fields the admin actually typed — a blank field leaves
-  // that setting unchanged. Clearing the collection has its own button
-  // below, since blank means "unchanged" here, not "clear".
+  const loadPreview = async () => {
+    setPreviewBusy(true);
+    try {
+      const out = await adminPayoutPreview(adminSecret, address);
+      setPreview(out);
+      pushLog(`Preview loaded: ${out.registeredCount} wallet(s) in the 24h window.`);
+    } catch (e) {
+      pushLog(`Preview failed: ${e.message}`);
+    } finally {
+      setPreviewBusy(false);
+    }
+  };
+
+  const pressPayout = async () => {
+    setPayoutBusy(true);
+    try {
+      const run = await adminRunPayout(adminSecret, address);
+      setLastRun(run);
+      pushLog(run.status === 'halted_price'
+        ? '⛔ Payout halted: the live price could not be read, so nothing was paid. Press again when the price is back.'
+        : `✅ Payout run ${run.day}: status ${run.status} — paid ${run.totalPaidWhole} ${rewardSymbol} to the registered wallets.`);
+      await loadStats();
+      if (address) await refreshViews(address);
+    } catch (e) {
+      pushLog(`Payout failed: ${e.message}`);
+    } finally {
+      setPayoutBusy(false);
+    }
+  };
+
   const saveNftSettings = async () => {
     const body = {};
-    if (nftCollectionInput.trim() !== '') body.collection = nftCollectionInput.trim();
-    if (nftMintInput !== '') body.mintCostWhole = nftMintInput;
-    if (nftRateBonusInput !== '') body.bonusRateBonusWhole = nftRateBonusInput;
-    if (nftRateCommonInput !== '') body.bonusRateCommonWhole = nftRateCommonInput;
-    if (nftRateUncommonInput !== '') body.bonusRateUncommonWhole = nftRateUncommonInput;
+    const list = (txt) => txt.split(/[\s,]+/).map((x) => x.trim()).filter(Boolean);
+    if (nftCollectionsInput.trim() !== '') body.collections = list(nftCollectionsInput);
+    if (nftExcludedInput.trim() !== '') body.excludedWallets = list(nftExcludedInput);
+    if (nftMintInput !== '') body.mintCost = nftMintInput;
+    if (nftRateBonusInput !== '') body.bonusRateBonus = nftRateBonusInput;
+    if (nftRateCommonInput !== '') body.bonusRateCommon = nftRateCommonInput;
+    if (nftRateUncommonInput !== '') body.bonusRateUncommon = nftRateUncommonInput;
     if (nftThresholdInput !== '') body.threshold = nftThresholdInput;
     if (nftCapInput !== '') body.supplyCap = nftCapInput;
     if (nftPoolWalletInput.trim() !== '') body.bonusPoolWallet = nftPoolWalletInput.trim();
@@ -244,180 +199,217 @@ export default function App() {
     await loadAdminNft();
   };
 
+  const refLink = address ? `${window.location.origin}${window.location.pathname}?ref=${address}` : '';
+
   return (
     <main>
       <div className="hero">
         <div className="planet">🌌</div>
         <h1>FRG Hold &amp; Earn</h1>
-        <p className="tagline">Hold FRG in your own wallet. Earn {rewardSymbol}. Nothing ever leaves your wallet.</p>
+        <p className="tagline">Hold FRG in your own wallet. Earn {rewardSymbol}, paid automatically. No wallet connect — just paste your address.</p>
+      </div>
+
+      <div className="security" role="alert">
+        🔒 <strong>Security:</strong> This app never asks you to connect your wallet or sign anything — you only paste your address. Any version that asks you to connect or sign is a fake.
       </div>
 
       <div className="card">
-        {connected ? (
-          <>
-            <p><span className="muted">Connected: </span><span className="mono">{address}</span></p>
-            <button className="ghost" onClick={() => chain.disconnect()}>Disconnect</button>
-          </>
-        ) : (
-          <button className="glow" onClick={() => chain.connect()}>🌌 Connect wallet</button>
-        )}
-        <p className="muted">{connected
-          ? 'Wallet connected — pick a wallet in the modal to switch.'
-          : 'Connect with Keplr, Station, or Galaxy Station. On your phone, pick a WalletConnect wallet and approve in the wallet app.'}</p>
-      </div>
-
-      <div className="card">
-        <h2>💰 Your holdings</h2>
-        <p>FRG in your wallet: <span className="big">{connected ? (holdings === null ? '…' : `${toWhole(holdings)}`) : '—'}</span> FRG</p>
-        {connected && holdings !== null && Number(holdings) === 0 && (
-          <p className="muted">No FRG in this wallet yet — rewards build up from daily snapshots of your FRG balance, so holding is what earns.</p>
-        )}
-        <p className="muted">Your FRG never leaves your wallet. No staking, no locking, no contracts.</p>
-      </div>
-
-      <div className="card">
-        <h2>🎁 Your rewards</h2>
-        <p>Accrued: <span className="big">{connected && rewards ? toWhole(rewards.accrued) : '—'}</span> {rewardSymbol}</p>
-        <p>Already collected: <span>{connected && rewards ? toWhole(rewards.paid) : '—'}</span> {rewardSymbol}</p>
-        <p>Ready to collect: <span className="big gold">{connected && rewards ? toWhole(rewards.claimable) : '—'}</span> {rewardSymbol}</p>
-        {connected && rewards && (
-          <p>{rewards.registeredToday
-            ? <span className="gold">✅ You are in today&apos;s round.</span>
-            : <span className="warn">You are not in today&apos;s round yet — register below. Registration is per-day: yesterday&apos;s does not count today.</span>}</p>
-        )}
-        {connected && (
-          <button className="cyan" onClick={doRegisterToday}>📝 Register for today&apos;s round</button>
-        )}
-        {connected && rewards && Number(rewards.claimable) === 0 && (
-          <p className="muted">No rewards accrued yet — they build up from daily snapshots of your holdings. Come back after a snapshot day.</p>
-        )}
-        <button className="glow" disabled={!connected || collecting || (rewards && Number(rewards.claimable) === 0)} onClick={doCollect}>
-          {collecting ? 'Collecting…' : '✨ Collect rewards'}
+        <h2>📋 Paste your wallet address</h2>
+        <p className="muted">Pasting your address registers your wallet for the daily payout and shows your balance and rewards. That is the only step — nothing is ever sent from your wallet.</p>
+        <input
+          type="text" placeholder="terra1…" value={paste}
+          onChange={(e) => setPaste(e.target.value)}
+          onKeyDown={(e) => { if (e.key === 'Enter') doRegister(); }}
+          autoComplete="off" spellCheck="false"
+        />
+        <button className="glow" disabled={regBusy || !paste.trim()} onClick={doRegister}>
+          {regBusy ? 'Registering…' : '✅ Register & view my wallet'}
         </button>
-        <p className="muted">Collect sends {rewardSymbol} from the program&apos;s payout wallet straight to your wallet. No amount is ever promised — what you see is what the snapshots earned.</p>
-      </div>
-
-      <div className="card">
-        <h2>🔋 Your FRG NFTs — bonus power</h2>
-        {connected ? (
-          <>
-            <div className="battery" aria-label={`Battery ${nft ? nft.chargePct : 0}% charged`}>
-              <div className="battery-fill" style={{ width: `${nft ? nft.chargePct : 0}%` }} />
-            </div>
-            <p>{nft ? `${nft.chargePct}% charged` : '…'}
-              {nft?.fullyPowered && <span className="gold"> 🔋 FULLY POWERED</span>}</p>
-            <p>NFTs held: <span className="big">{nft ? nft.nftCount : '…'}</span>
-              <span className="muted"> · power: {nft ? nft.power : '…'}</span></p>
-            <p className="muted">All your NFTs roll into one calculation — that number is your power.
-              {nft && (nft.thresholdSet
-                ? ` At ${nft.threshold} NFTs the battery shows fully powered.`
-                : ' The admin has not set the fully-powered threshold yet.')}</p>
-            {nft && !nft.configured && (
-              <p className="warn">{nft.bonusNotice || 'No NFT bonus collections are connected yet — bonus holdings read as zero.'} Minting is not open yet.</p>
-            )}
-            {nft?.configured && !nft.bonusRateSet && (
-              <p className="warn">{nft.bonusNotice}</p>
-            )}
-            {nft?.configured && (
-              <>
-                <p>Bonus accrued: {toWhole(nft.accrued)} FRG · Ready to collect: <span className="big gold">{toWhole(nft.claimable)}</span> FRG</p>
-                {nft.nftTypeCounts && (
-                  <p className="muted">Your NFTs by type: {nft.nftTypeCounts.bonus} Bonus · {nft.nftTypeCounts.common} Common · {nft.nftTypeCounts.uncommon} Uncommon</p>
-                )}
-                <p className="muted">Bonus rates: {nft.bonusRateSet && nft.bonusRates ? `Bonus ${toWhole(nft.bonusRates.bonus)} · Common ${toWhole(nft.bonusRates.common)} · Uncommon ${toWhole(nft.bonusRates.uncommon)} FRG per NFT per snapshot day` : 'not set yet — no NFT bonus accrues'}
-                  · Mint price: {toWhole(nft.mintCost)} FRG
-                  · Bonus pool available: {toWhole(nft.bonusPoolAvailable)} FRG</p>
-                {nft.lastSnapshotDay === null && (
-                  <p className="muted">No NFT snapshot yet for this wallet — counts update on the next snapshot day.</p>
-                )}
-                <button className="glow" disabled={collectingNft || Number(nft.claimable) === 0} onClick={doCollectNft}>
-                  {collectingNft ? 'Collecting…' : '✨ Collect NFT bonus'}
-                </button>
-                <button className="glow" disabled={!nft.mintReady || minting} onClick={doMint}>
-                  {minting ? 'Minting…' : '🔋 Mint NFT'}
-                </button>
-                <p className="muted">{nft.mintNotice} Minting sends the mint fee in FRG from your wallet to the collection — the contract forwards it to the bonus pool wallet. Your wallet signs the mint; nothing is minted without your approval.</p>
-              </>
-            )}
-          </>
-        ) : (
-          <p className="muted">Connect your wallet to see your NFT bonus power.</p>
+        {address && (
+          <p><span className="muted">Viewing: </span><span className="mono">{address}</span></p>
         )}
       </div>
 
+      {address && (
+        <div className="card">
+          <h2>💰 Your holdings &amp; rewards</h2>
+          <p>FRG in your wallet: <span className="big">{holdings === null ? '…' : toWhole(holdings)}</span> FRG</p>
+          {rewards && (
+            <>
+              <p>{rewards.registeredInWindow
+                ? <span className="gold">✅ Registered — you are in the 24-hour window for the next payout.</span>
+                : <span className="warn">Not in the current 24-hour window — paste your address above again to re-register before the next payout.</span>}</p>
+              <p>Accrued: <span className="big">{toWhole(rewards.accrued)}</span> {rewardSymbol}
+                {' · '}Already paid to you: {toWhole(rewards.paid)} {rewardSymbol}</p>
+              <p>Carried (below the 1 {rewardSymbol} send minimum, pays out once it adds up): <span className="gold">{toWhole(rewards.claimable)}</span> {rewardSymbol}</p>
+            </>
+          )}
+          <p className="muted">Payouts are sent automatically from the program&apos;s payout wallet when the owner runs the daily payout — you never collect, connect, or sign anything. Your FRG never leaves your wallet: no staking, no locking, no contracts.</p>
+          <button className="ghost" onClick={() => refreshViews(address)}>🔄 Refresh</button>
+        </div>
+      )}
+
       <div className="card">
-        <h2>🤝 Your referral link</h2>
-        {connected ? (
+        <h2>📊 How much you earn</h2>
+        {stats ? (
           <>
-            <p className="mono linkbox">{refLink}</p>
-            <button className="cyan" onClick={() => {
-              if (navigator.clipboard) navigator.clipboard.writeText(refLink).then(() => pushLog('Referral link copied.'));
-              else pushLog(`Copy this link: ${refLink}`);
-            }}>Copy link</button>
-            <p>Referrals: <span className="big">{referrals ? referrals.count : '…'}</span>
-              {referrals && <span className="muted"> · bonus earned from referrals: {toWhole(referrals.bonusEarned)} {rewardSymbol}</span>}</p>
-            <p className="muted">Friends who connect through your link are linked to you. A referral bonus is planned — it would be paid from the reward pot, never taken from their share. Affiliate details are still to be confirmed: the rate shown ({stats ? `${stats.affiliateRatePercent}%` : '…'}) is a proposed default, not final.</p>
+            <p className="muted">Every day, you are paid a percentage of the FRG you hold — your percentage depends on how much you hold:</p>
+            <table className="payout">
+              <thead><tr><th>Hold at least</th><th>You earn per day</th></tr></thead>
+              <tbody>
+                {stats.rewardTiers.map((t) => (
+                  <tr key={t.minBase}><td>{toWhole(t.minBase)} FRG</td><td>{t.pct}% of your FRG</td></tr>
+                ))}
+              </tbody>
+            </table>
+            <p className="muted">The total paid to ALL holders together is capped at ${stats.dailyCapUsd} worth of FRG per day (worked out at the live price when the payout runs). If one day&apos;s earnings go over the cap, everyone scales down evenly for that day. Wallets registered in the last 24 hours: <strong>{stats.registeredLast24h}</strong>.</p>
+            {stats.lastPayoutRun && (
+              <p className="muted">Last payout: {stats.lastPayoutRun.day} — {stats.lastPayoutRun.totalPaidWhole} {rewardSymbol} paid to {stats.lastPayoutRun.registeredCount} registered wallet(s), status: {stats.lastPayoutRun.status}.</p>
+            )}
+            <p className="muted">Program totals: {stats.holders} wallets registered all-time · {toWhole(stats.totalPaid)} {rewardSymbol} paid out so far.</p>
           </>
-        ) : (
-          <p className="muted">Connect your wallet to get your referral link.</p>
-        )}
+        ) : <p className="muted">Loading program details…</p>}
       </div>
+
+      {address && (
+        <div className="card">
+          <h2>🔋 Your FRG NFTs — bonus power</h2>
+          {nft ? (
+            <>
+              <div className="battery" aria-label={`Battery ${nft.chargePct}% charged`}>
+                <div className="battery-fill" style={{ width: `${nft.chargePct}%` }} />
+              </div>
+              <p>{nft.chargePct}% charged{nft.fullyPowered && <span className="gold"> 🔋 FULLY POWERED</span>}</p>
+              <p>NFTs held: <span className="big">{nft.nftCount}</span><span className="muted"> · power: {nft.power}</span></p>
+              {nft.nftTypeCounts && (
+                <p className="muted">By type: {nft.nftTypeCounts.bonus} Bonus · {nft.nftTypeCounts.common} Common · {nft.nftTypeCounts.uncommon} Uncommon</p>
+              )}
+              {!nft.configured && <p className="warn">{nft.bonusNotice}</p>}
+              {nft.configured && (
+                <>
+                  <p>Bonus accrued: {toWhole(nft.accrued)} FRG · Ready to collect: <span className="big gold">{toWhole(nft.claimable)}</span> FRG</p>
+                  <button className="glow" disabled={collectingNft || Number(nft.claimable) === 0} onClick={doCollectNft}>
+                    {collectingNft ? 'Collecting…' : '✨ Collect NFT bonus'}
+                  </button>
+                  <p className="muted">The NFT bonus is paid from the program&apos;s bonus pool by the server — collecting never asks you to sign anything either.</p>
+                </>
+              )}
+            </>
+          ) : <p className="muted">Loading NFT bonus…</p>}
+        </div>
+      )}
+
+      {address && (
+        <div className="card">
+          <h2>🤝 Your referral link</h2>
+          <p className="mono linkbox">{refLink}</p>
+          <button className="cyan" onClick={() => {
+            if (navigator.clipboard) navigator.clipboard.writeText(refLink).then(() => pushLog('Referral link copied.'));
+            else pushLog(`Copy this link: ${refLink}`);
+          }}>Copy link</button>
+          <p>Referrals: <span className="big">{referrals ? referrals.count : '…'}</span>
+            {referrals && <span className="muted"> · bonus earned from referrals: {toWhole(referrals.bonusEarned)} {rewardSymbol}</span>}</p>
+          <p className="muted">Friends who paste their address after opening your link are linked to you. A referral bonus is planned — it would be paid on top, never taken from their earnings. Details are still to be confirmed.</p>
+        </div>
+      )}
 
       <div className="card">
         <h2>🌠 How it works</h2>
         <ol>
           <li>Hold FRG in your own wallet — it never moves.</li>
-          <li>Click Register each day to join that day&apos;s round. Registration is per-day — yesterday&apos;s registration does not count today.</li>
-          <li>At the end of the day, the day&apos;s pot empties completely to that day&apos;s registered wallets, split by how much FRG each one holds in the day&apos;s snapshot. The bigger your share of the holdings, the bigger your share of the pot. Nothing rolls over to the next day.</li>
-          <li>Simple as that: hold and earn — the same rules for everyone, every day. No bonuses for holding longer, no special rates.</li>
-          <li>Come here any time and Collect — {rewardSymbol} rewards arrive from the payout wallet.</li>
-          <li>Share your referral link: a referral bonus is planned (details to be confirmed) — it would come from the same pot, never from your referrals&apos; share.</li>
+          <li>Paste your wallet address above. That registers you — no wallet connect, no signing, ever.</li>
+          <li>Stay registered: your paste counts for payouts run within 24 hours of it. Paste again any time to refresh.</li>
+          <li>Every day, you earn a set percentage of the FRG you hold (see the table above — bigger holdings, bigger percentage).</li>
+          <li>At the end of the day the payout is sent to you automatically. The pool only pays what is owed — it never empties just because a day ran.</li>
         </ol>
-        {stats && (
-          <p className="muted">Program totals: {stats.holders} holders · {toWhole(stats.totalPaid)} {rewardSymbol} paid out · today&apos;s pot {toWhole(stats.dailyPot ?? stats.dailyPool)} {rewardSymbol} · {stats.registeredToday} registered today · {stats.snapshotDays.length} snapshot days so far.</p>
-        )}
-        <button className="ghost" onClick={refresh}>🔄 Refresh</button>
+        <button className="ghost" onClick={loadStats}>🔄 Refresh</button>
       </div>
 
       {isAdmin && (
         <div className="card admin">
           <h2>🛠️ Admin panel</h2>
-          <p className="muted">Only visible to the admin wallet. The admin secret is typed here per session — it is never saved in the app or the browser.</p>
+          <p className="muted">Shown because the pasted wallet is the admin wallet. The admin secret is typed here per session — it is never saved in the app or the browser — and every admin action is checked against it on the server.</p>
           <input type="password" placeholder="Admin secret" value={adminSecret} onChange={(e) => setAdminSecret(e.target.value)} />
           <button className="cyan" onClick={loadAdmin}>Load admin stats</button>
           {adminStats && (
             <div className="adminstats">
               <p>Holders: {adminStats.holders} · Paid out: {toWhole(adminStats.totalPaid)} {adminStats.rewardSymbol || rewardSymbol} · Accrued: {toWhole(adminStats.totalAccrued)} {adminStats.rewardSymbol || rewardSymbol}</p>
-              <p>Daily pot: {toWhole(adminStats.dailyPot ?? adminStats.dailyPool)} {adminStats.rewardSymbol || rewardSymbol} (empties to each day&apos;s registered wallets) · Registered today: {adminStats.registeredToday} · Affiliate rate: {adminStats.affiliateRatePercent}%</p>
+              <p>Registered in the last 24h: {adminStats.registeredLast24h} · Daily cap: ${adminStats.dailyCapUsd} total · Affiliate rate: {adminStats.affiliateRatePercent}%</p>
               <p>Payout wallet: {adminStats.payoutAddress ? <span className="mono">{adminStats.payoutAddress}</span> : 'not set yet'}
                 {adminStats.payoutBalance !== null && <> · FRG balance: {toWhole(adminStats.payoutBalance)} FRG</>}
                 {adminStats.payoutUstcBalance !== null && adminStats.payoutUstcBalance !== undefined && <> · USTC balance (dormant future option): {toWhole(adminStats.payoutUstcBalance)} USTC</>}
-                {!adminStats.payoutCanSend && <span className="warn"> · auto-payout key not configured — collects will report &quot;not configured&quot; until the key is set in Railway</span>}</p>
+                {!adminStats.payoutCanSend && <span className="warn"> · auto-payout key not configured — the payout button will report &quot;not configured&quot; until the key is set in Railway</span>}</p>
               {(adminStats.rewardMigrations || (adminStats.rewardMigration ? [adminStats.rewardMigration] : []))
                 .filter((m) => m && m.archivedRows > 0)
                 .map((m) => (
                   <p key={m.id}>Currency switch {m.fromSymbol} → {m.toSymbol}: {m.archivedRows} {m.fromSymbol}-denominated accrual rows archived on {new Date(m.migratedAt).toLocaleDateString()} ({m.archivedAmountWhole} {m.fromSymbol} gross, {m.archivedUnpaidAmountWhole} {m.fromSymbol} unpaid) — archived only, not payable as {m.toSymbol}. The daily pool was reset to 0 at the switch.</p>
                 ))}
-              <p>Snapshot days: {adminStats.snapshotDays.length ? adminStats.snapshotDays.join(', ') : 'none yet'}</p>
-              {adminStats.nft && (
-                <p>NFT: collection {adminStats.nft.collection || 'not configured'}
-                  {' · '}bonus collections {(adminStats.nft.collections || []).length} connected
-                  {adminStats.nft.bonusRateSet ? '' : ' (rate not set yet)'}
-                  {' · '}mint {adminStats.nft.mintCostWhole} FRG
-                  {adminStats.nft.bonusRatesWhole && <>{' · '}bonus rates B {adminStats.nft.bonusRatesWhole.bonus} / C {adminStats.nft.bonusRatesWhole.common} / U {adminStats.nft.bonusRatesWhole.uncommon} FRG/day</>}
-                  {' · '}threshold {adminStats.nft.threshold}
-                  {' · '}cap {adminStats.nft.supplyCap || 'unlimited'}
-                  {' · '}bonus pool available {adminStats.nft.bonusPoolAvailableWhole} FRG</p>
+              {adminStats.lastPayoutRun && (
+                <p>Last payout run: {adminStats.lastPayoutRun.day} · status {adminStats.lastPayoutRun.status} · paid {adminStats.lastPayoutRun.totalPaidWhole} {rewardSymbol} · {adminStats.lastPayoutRun.registeredCount} registered in window</p>
               )}
             </div>
           )}
-          <label className="muted" htmlFor="pool-input">Daily pot ({adminStats?.rewardSymbol || rewardSymbol}) — the amount that empties to each day&apos;s registered wallets, split by what they hold. 0 = rounds off.</label>
-          <input id="pool-input" type="number" min="0" step="any" placeholder="e.g. 1000" value={poolInput} onChange={(e) => setPoolInput(e.target.value)} />
-          <button className="cyan" onClick={() => poolInput && doAdmin('Daily pot set', () => adminSetPool(adminSecret, address, poolInput))}>Set daily pot</button>
+
+          <h2>📊 Tier table</h2>
+          <p className="muted">Each row: hold at least X FRG → earn Y% of holdings per day. The first row starts at 0 so every holder has a tier. Changing tiers never changes a day that already paid.</p>
+          {tierRows.map((r, i) => (
+            <div key={i}>
+              <input type="number" min="0" step="any" placeholder="Hold at least (FRG)" value={r.minWhole}
+                onChange={(e) => setTierRows(tierRows.map((x, j) => (j === i ? { ...x, minWhole: e.target.value } : x)))} />
+              <input type="number" min="0" max="100" step="any" placeholder="% per day" value={r.pct}
+                onChange={(e) => setTierRows(tierRows.map((x, j) => (j === i ? { ...x, pct: e.target.value } : x)))} />
+            </div>
+          ))}
+          <button className="ghost" onClick={() => setTierRows([...tierRows, { minWhole: '', pct: '' }])}>+ Add tier</button>
+          <button className="cyan" onClick={saveTiers}>Save tier table</button>
+
+          <label className="muted" htmlFor="cap-input">Daily cap (USD) — the most ALL holders together can be paid per day; converted to FRG at the live price when the payout runs. 0 = no cap.</label>
+          <input id="cap-input" type="number" min="0" step="any" placeholder="e.g. 0.50" value={capInput} onChange={(e) => setCapInput(e.target.value)} />
+          <button className="cyan" onClick={() => capInput !== '' && doAdmin('Daily cap set', () => adminSetCap(adminSecret, address, Number(capInput)))}>Set daily cap</button>
+
           <label className="muted" htmlFor="rate-input">Affiliate rate (%) — proposed default, pending confirmation</label>
           <input id="rate-input" type="number" min="0" max="100" step="any" placeholder="e.g. 10" value={rateInput} onChange={(e) => setRateInput(e.target.value)} />
           <button className="cyan" onClick={() => rateInput && doAdmin('Affiliate rate set', () => adminSetRate(adminSecret, address, rateInput))}>Set affiliate rate</button>
-          <button className="glow" onClick={() => doAdmin('Snapshot run', () => adminSnapshot(adminSecret, address))}>📸 Run snapshot now</button>
+
+          <h2>💸 Daily payout</h2>
+          <p className="muted">Review the table first — nothing sends until you press the payout button. The table shows every wallet registered in the last 24 hours, what it holds, its tier, what it is owed, and what it will be paid after the cap.</p>
+          <button className="cyan" disabled={previewBusy} onClick={loadPreview}>{previewBusy ? 'Loading…' : '👁 Load payout preview'}</button>
+          {preview && (
+            <div className="adminstats">
+              <p>Registered in window: <strong>{preview.registeredCount}</strong> · Total owed: {preview.totalOwedWhole} {rewardSymbol}
+                {preview.scaledToCap && <> · Over the cap — scaled to exactly {preview.capWhole} {rewardSymbol} (${preview.dailyCapUsd} at {preview.priceFrgUsd ? `$${preview.priceFrgUsd}` : 'live price'} per FRG)</>}
+                {' · '}Pool balance: {preview.poolBalanceWhole} {rewardSymbol} · Pool keeps after payout: {preview.poolRemainderWhole} {rewardSymbol}</p>
+              <table className="payout">
+                <thead><tr><th>Wallet</th><th>Holds</th><th>Tier</th><th>Owed</th><th>Will be paid</th></tr></thead>
+                <tbody>
+                  {preview.rows.map((r) => (
+                    <tr key={r.wallet}>
+                      <td className="addr">{shortAddr(r.wallet)}</td>
+                      <td>{r.balanceWhole}</td>
+                      <td>{r.pct}%</td>
+                      <td>{r.owedWhole}</td>
+                      <td>{r.scaledWhole}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+          <button className="glow" disabled={payoutBusy} onClick={pressPayout}>
+            {payoutBusy ? 'Paying…' : '💸 PRESS TO PAY OUT'}
+          </button>
+          {lastRun && (
+            <div className="adminstats">
+              <p>Run {lastRun.day}: <strong>{lastRun.status}</strong> · paid {lastRun.totalPaidWhole} {rewardSymbol} · owed {lastRun.totalOwedWhole} {rewardSymbol}
+                {Number(lastRun.shortfall) > 0 && <> · shortfall {toWhole(lastRun.shortfall)} {rewardSymbol} (stays owed)</>}
+                {' · '}{lastRun.registeredCount} registered in window</p>
+              {lastRun.detail?.rows?.map((r) => (
+                <p key={r.wallet} className="mono">{shortAddr(r.wallet)}: owed {toWhole(r.owed)} → sent {toWhole(r.sent)} ({r.payStatus}){r.txhash && <> · <a href={`${FINDER}/tx/${r.txhash}`} target="_blank" rel="noreferrer">tx</a></>}</p>
+              ))}
+            </div>
+          )}
+          <button className="ghost" onClick={() => doAdmin('NFT snapshot run', () => adminSnapshot(adminSecret, address))}>📸 Run NFT snapshot now</button>
+
           <h2>🔋 NFT settings</h2>
           <p className="muted">All NFT numbers are adjustable here — nothing is hardcoded. Leave a field blank to leave that setting unchanged. Invalid numbers are rejected with a visible error.</p>
           <button className="cyan" onClick={loadAdminNft}>Load NFT admin stats</button>
@@ -427,51 +419,45 @@ export default function App() {
               <p>Bonus collections: {(adminNft.collections || []).length
                 ? adminNft.collections.map((c) => <span key={c} className="mono">{c}<br /></span>)
                 : 'none connected — NFT bonus counts read as zero'}</p>
-              <p>Excluded wallets (no NFT bonus): {(adminNft.excludedWallets || []).length
+              <p>Excluded wallets: {(adminNft.excludedWallets || []).length
                 ? adminNft.excludedWallets.map((c) => <span key={c} className="mono">{c}<br /></span>)
-                : 'none — every wallet counts'}</p>
-              <p>Bonus rates: {adminNft.bonusRateSet && adminNft.bonusRatesWhole
-                ? `Bonus ${adminNft.bonusRatesWhole.bonus} · Common ${adminNft.bonusRatesWhole.common} · Uncommon ${adminNft.bonusRatesWhole.uncommon} FRG per NFT per day`
-                : 'not set yet — collections are connected but no NFT bonus accrues'}</p>
-              <p>Mint price: {adminNft.mintCostWhole} FRG</p>
-              <p>Threshold: {adminNft.threshold} · Supply cap: {adminNft.supplyCap || 'unlimited'}</p>
-              <p>Bonus pool wallet: {adminNft.bonusPoolWallet ? <span className="mono">{adminNft.bonusPoolWallet}</span> : 'not set — bonus payouts are blocked until it is set'}</p>
-              <p>Bonus pool: funded {adminNft.bonusPoolFundedWhole} FRG · available {adminNft.bonusPoolAvailableWhole} FRG · paid {toWhole(adminNft.bonusPoolPaid)} FRG</p>
-              <p>NFT snapshot days: {adminNft.snapshotDays.length ? adminNft.snapshotDays.join(', ') : 'none yet'}</p>
+                : 'none'}</p>
+              <p>Bonus rates: Bonus {adminNft.bonusRatesWhole.bonus} · Common {adminNft.bonusRatesWhole.common} · Uncommon {adminNft.bonusRatesWhole.uncommon} FRG per NFT per day</p>
+              <p>Mint: {adminNft.mintCostWhole} FRG · Threshold: {adminNft.threshold} · Supply cap: {adminNft.supplyCap || 'unlimited'}</p>
+              <p>Bonus pool wallet: {adminNft.bonusPoolWallet ? <span className="mono">{adminNft.bonusPoolWallet}</span> : 'not set'} · funded {adminNft.bonusPoolFundedWhole} FRG · available {adminNft.bonusPoolAvailableWhole} FRG</p>
             </div>
           )}
-          <label className="muted" htmlFor="nft-collections-input">Bonus collections (CW721 addresses, one per line — holdings across all of them count as one NFT total per holder). This box replaces the whole list when saved; empty disconnects all bonus collections.</label>
-          <textarea id="nft-collections-input" rows="3" placeholder="terra1…" value={nftCollectionsInput} onChange={(e) => setNftCollectionsInput(e.target.value)} />
-          <button className="cyan" onClick={saveBonusCollections}>Save bonus collections</button>
-          <label className="muted" htmlFor="nft-excluded-input">Excluded wallets (no NFT bonus) — wallet addresses, one per line. These wallets record an NFT count of 0 and never accrue NFT bonus; their base hold-and-earn rewards are unaffected. This box replaces the whole list when saved; empty clears all exclusions.</label>
-          <textarea id="nft-excluded-input" rows="3" placeholder="terra1…" value={nftExcludedInput} onChange={(e) => setNftExcludedInput(e.target.value)} />
-          <button className="cyan" onClick={saveExcludedWallets}>Save excluded wallets</button>
-          <label className="muted" htmlFor="nft-collection-input">NFT collection address (CW721 — mint collection)</label>
-          <input id="nft-collection-input" placeholder="terra1…" value={nftCollectionInput} onChange={(e) => setNftCollectionInput(e.target.value)} />
-          <label className="muted" htmlFor="nft-mint-input">Mint price (FRG)</label>
-          <input id="nft-mint-input" type="number" min="0" step="any" placeholder="e.g. 1000" value={nftMintInput} onChange={(e) => setNftMintInput(e.target.value)} />
-          <label className="muted" htmlFor="nft-rate-bonus-input">Bonus rate — Bonus NFTs (the default type, no rarity) (FRG per day)</label>
-          <input id="nft-rate-bonus-input" type="number" min="0" step="any" placeholder="e.g. 4" value={nftRateBonusInput} onChange={(e) => setNftRateBonusInput(e.target.value)} />
-          <label className="muted" htmlFor="nft-rate-common-input">Bonus rate — Common NFTs (FRG per day)</label>
-          <input id="nft-rate-common-input" type="number" min="0" step="any" placeholder="e.g. 50" value={nftRateCommonInput} onChange={(e) => setNftRateCommonInput(e.target.value)} />
-          <label className="muted" htmlFor="nft-rate-uncommon-input">Bonus rate — Uncommon NFTs (FRG per day)</label>
-          <input id="nft-rate-uncommon-input" type="number" min="0" step="any" placeholder="e.g. 100" value={nftRateUncommonInput} onChange={(e) => setNftRateUncommonInput(e.target.value)} />
-          <label className="muted" htmlFor="nft-threshold-input">Fully-powered threshold (NFT count, 0 = unset)</label>
-          <input id="nft-threshold-input" type="number" min="0" step="1" placeholder="e.g. 10" value={nftThresholdInput} onChange={(e) => setNftThresholdInput(e.target.value)} />
-          <label className="muted" htmlFor="nft-cap-input">Supply cap (0 = unlimited)</label>
-          <input id="nft-cap-input" type="number" min="0" step="1" placeholder="e.g. 1000" value={nftCapInput} onChange={(e) => setNftCapInput(e.target.value)} />
-          <label className="muted" htmlFor="nft-pool-wallet-input">Bonus pool wallet (receives mint fees)</label>
-          <input id="nft-pool-wallet-input" placeholder="terra1…" value={nftPoolWalletInput} onChange={(e) => setNftPoolWalletInput(e.target.value)} />
+          <label className="muted">Bonus collections (one per line or comma-separated)</label>
+          <textarea rows="2" value={nftCollectionsInput} onChange={(e) => setNftCollectionsInput(e.target.value)} />
+          <label className="muted">Excluded wallets (no NFT bonus; one per line)</label>
+          <textarea rows="2" value={nftExcludedInput} onChange={(e) => setNftExcludedInput(e.target.value)} />
+          <label className="muted">Mint cost (FRG)</label>
+          <input type="number" min="0" step="any" value={nftMintInput} onChange={(e) => setNftMintInput(e.target.value)} />
+          <label className="muted">Bonus rate — Bonus type (FRG per NFT per day)</label>
+          <input type="number" min="0" step="any" value={nftRateBonusInput} onChange={(e) => setNftRateBonusInput(e.target.value)} />
+          <label className="muted">Bonus rate — Common type (FRG per NFT per day)</label>
+          <input type="number" min="0" step="any" value={nftRateCommonInput} onChange={(e) => setNftRateCommonInput(e.target.value)} />
+          <label className="muted">Bonus rate — Uncommon type (FRG per NFT per day)</label>
+          <input type="number" min="0" step="any" value={nftRateUncommonInput} onChange={(e) => setNftRateUncommonInput(e.target.value)} />
+          <label className="muted">Fully-powered threshold (NFT count)</label>
+          <input type="number" min="0" step="1" value={nftThresholdInput} onChange={(e) => setNftThresholdInput(e.target.value)} />
+          <label className="muted">Supply cap (0 = unlimited)</label>
+          <input type="number" min="0" step="1" value={nftCapInput} onChange={(e) => setNftCapInput(e.target.value)} />
+          <label className="muted">Bonus pool wallet</label>
+          <input type="text" value={nftPoolWalletInput} onChange={(e) => setNftPoolWalletInput(e.target.value)} />
           <button className="cyan" onClick={saveNftSettings}>Save NFT settings</button>
-          <button className="ghost" onClick={() => doAdmin('NFT collection cleared', () => adminSetNftSettings(adminSecret, address, { collection: '' }))}>Clear NFT collection</button>
-          <label className="muted" htmlFor="nft-fund-input">Bonus pool funding (FRG — real mint proceeds only)</label>
-          <input id="nft-fund-input" type="number" min="0" step="any" placeholder="e.g. 5000" value={nftFundInput} onChange={(e) => setNftFundInput(e.target.value)} />
-          <input placeholder="Note, e.g. mint txhash (optional)" value={nftFundNoteInput} onChange={(e) => setNftFundNoteInput(e.target.value)} />
-          <button className="cyan" onClick={() => nftFundInput && doAdmin('Bonus pool funded', () => adminFundBonusPool(adminSecret, address, nftFundInput, nftFundNoteInput || null))}>Record bonus pool funding</button>
+          <label className="muted">Record bonus pool funding (FRG — real mint-fee proceeds only)</label>
+          <input type="number" min="0" step="any" value={nftFundInput} onChange={(e) => setNftFundInput(e.target.value)} />
+          <input type="text" placeholder="Note (e.g. mint tx hash)" value={nftFundNoteInput} onChange={(e) => setNftFundNoteInput(e.target.value)} />
+          <button className="cyan" onClick={() => nftFundInput && doAdmin('Funding recorded', () => adminFundBonusPool(adminSecret, address, nftFundInput, nftFundNoteInput))}>Record funding</button>
         </div>
       )}
 
-      {log && <div className="card log"><pre>{log}</pre></div>}
+      {log && (
+        <div className="card log">
+          <pre>{log}</pre>
+        </div>
+      )}
     </main>
   );
 }

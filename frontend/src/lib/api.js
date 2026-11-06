@@ -45,12 +45,13 @@ export async function fetchHoldings(address) {
 }
 
 export const getStats = () => api('/api/stats');
+export const getBalance = (address) => api(`/api/balance?address=${address}`);
 export const getRewards = (address) => api(`/api/rewards?address=${address}`);
 export const getReferrals = (address) => api(`/api/referrals?address=${address}`);
+// THE registration call: pasting an address registers it (and
+// refreshes its 24h window). No wallet connect exists in this app.
 export const register = (address, referrer) =>
   api('/api/register', { method: 'POST', body: JSON.stringify({ address, referrer }) });
-export const collect = (address) =>
-  api('/api/collect', { method: 'POST', body: JSON.stringify({ address }) });
 
 const adminHeaders = (secret, address) => ({
   'x-admin-wallet': address,
@@ -58,39 +59,27 @@ const adminHeaders = (secret, address) => ({
 });
 export const getAdmin = (secret, address) =>
   api('/api/admin', { headers: adminHeaders(secret, address) });
-export const adminSetPool = (secret, address, poolWhole) =>
-  api('/api/admin/pool', { method: 'POST', headers: adminHeaders(secret, address), body: JSON.stringify({ poolWhole }) });
 export const adminSetRate = (secret, address, percent) =>
   api('/api/admin/rate', { method: 'POST', headers: adminHeaders(secret, address), body: JSON.stringify({ percent }) });
 export const adminSnapshot = (secret, address) =>
   api('/api/admin/snapshot', { method: 'POST', headers: adminHeaders(secret, address) });
+export const adminSetTiers = (secret, address, tiers) =>
+  api('/api/admin/tiers', { method: 'POST', headers: adminHeaders(secret, address), body: JSON.stringify({ tiers }) });
+export const adminSetCap = (secret, address, capUsd) =>
+  api('/api/admin/cap', { method: 'POST', headers: adminHeaders(secret, address), body: JSON.stringify({ capUsd }) });
+export const adminPayoutPreview = (secret, address) =>
+  api('/api/admin/payout-preview', { headers: adminHeaders(secret, address) });
+export const adminRunPayout = (secret, address) =>
+  api('/api/admin/payout', { method: 'POST', headers: adminHeaders(secret, address), body: JSON.stringify({}) });
 
-// --- NFT bonus section ---
-// The backend never decides a mint: the mint below is a real
-// wallet-signed CW20 send from the connected wallet to the collection
-// contract. These helpers only read backend state and report txhashes.
+// --- NFT bonus section (separate ledger; viewing is paste-only,
+// bonus Collect is a server-side payout — no signing anywhere) ---
 export const getNft = (address) => api(`/api/nft?address=${address}`);
 export const collectNftBonus = (address) =>
   api('/api/nft/collect', { method: 'POST', body: JSON.stringify({ address }) });
-export const recordMint = (address, txhash) =>
-  api('/api/nft/mint-record', { method: 'POST', body: JSON.stringify({ address, txhash }) });
 export const getAdminNft = (secret, address) =>
   api('/api/admin/nft', { headers: adminHeaders(secret, address) });
 export const adminSetNftSettings = (secret, address, settings) =>
   api('/api/admin/nft/settings', { method: 'POST', headers: adminHeaders(secret, address), body: JSON.stringify(settings) });
 export const adminFundBonusPool = (secret, address, amountWhole, note) =>
   api('/api/admin/nft/fund', { method: 'POST', headers: adminHeaders(secret, address), body: JSON.stringify({ amountWhole, note }) });
-
-// Read-only LCD smart queries against the NFT collection contract
-// (used to verify the contract matches the app settings BEFORE the
-// user signs any mint — never to decide amounts server-side).
-async function collectionQuery(collection, query) {
-  const res = await fetchWithTimeout(
-    `${LCD_URL}/cosmwasm/wasm/v1/contract/${collection}/smart/${b64(query)}`);
-  if (!res.ok) throw new Error(`Collection query failed (${res.status})`);
-  const data = await res.json();
-  return data.data;
-}
-export const fetchNftContractConfig = (collection) => collectionQuery(collection, { config: {} });
-export const fetchNftNumTokens = (collection) =>
-  collectionQuery(collection, { num_tokens: {} }).then((d) => d.count);

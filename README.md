@@ -3,16 +3,19 @@
 Hold FRG in your own wallet, earn FRG rewards. **Core hold-and-earn: no
 contracts, no staking, no cross-staking, no locking.** Holders keep
 their FRG in their own wallets at all times; they visit the website,
-connect, and Collect rewards. A separate opt-in NFT bonus section
+**paste their wallet address** (there is NO wallet connect anywhere
+in this app), and the daily payout is sent to them automatically
+when the owner presses the payout button. A separate opt-in NFT bonus section
 exists (see below) — it is inactive until the admin configures a
 real CW721 collection, and no collection is deployed yet. Earnings are measured by **daily balance snapshots** over time,
 so buying just before a payout and selling right after earns nothing
 for the days you were not holding.
 
 > **Status: CORE BUILD COMPLETE. Affiliate program = STUB ONLY.**
-> The core (hold → register for the day → snapshot → the day's pot
-> empties pro-rata to that day's registered wallets → Collect →
-> admin) is built and tested. The affiliate
+> The core (hold → paste-register → snapshot → owed = tier % ×
+> holdings, $0.50/day total cap at the live price → the owner
+> reviews the table and presses the payout button → automatic
+> sends) is built and tested. The affiliate
 > program is NOT finished: referral link capture/storage and a
 > configurable rate exist, but the rate (default 10%) is a
 > **proposed default, UNCONFIRMED**, and the affiliate rules are
@@ -21,12 +24,14 @@ for the days you were not holding.
 
 ## How it works
 
-1. A holder connects their wallet (first connect registers them; an
-   optional `?ref=<wallet>` link records their referrer — first touch
-   wins, the binding can never be changed later). Registering ALSO
-   enters the wallet in **that day's round** — and that part is
-   per-day: a wallet must register again each day to share in that
-   day's pot. Yesterday's registration earns nothing today.
+1. A holder **pastes their wallet address**. Pasting registers the
+   wallet: an optional `?ref=<wallet>` link records their referrer
+   (first touch wins, the binding can never be changed later), and
+   the registration **timestamp** is set. A payout run includes a
+   wallet iff its timestamp is within the **24 hours before the
+   run** (rolling window — the owner's "register within 24 hours"
+   rule). Pasting again refreshes the timestamp. Invalid addresses
+   are rejected with a plain error and nothing is recorded.
 2. The backend samples every registered wallet's FRG balance (live
    from the Terra Classic LCD) **once an hour**. Once a day, the
    snapshot fixes each wallet's weight as its **average sampled
@@ -34,49 +39,61 @@ for the days you were not holding.
    the weight of holding it all day, so flash-holding into the
    snapshot moment does not pay. A wallet with no samples that day
    falls back to a single live read at snapshot time.
-3. At the end of the day, the **daily pot** (an FRG amount the owner
-   sets; the `daily_pool` setting) **empties completely** to the
-   wallets that registered for that day, split **pro-rata by their
-   snapshot FRG balances**: the shares sum exactly to the pot
-   (integer rounding dust goes to the day's largest holder) and
-   nothing rolls over to the next day. This is the owner's design
-   (2026-11-05), replacing both the original all-holders split and
-   a short-lived rate+cap idea. **No rate, no cap-scaling, no time
-   bonuses, no holding-duration multipliers, no loyalty weighting**
-   — just a simple concept: hold and earn, the same rules for
-   everyone, every day. Pot 0 (the default) = rounds off, nothing
-   accrues, until the owner sets the pot amount. A registered
-   wallet holding 0 FRG earns 0; a wallet that did not register
-   that day earns 0 for that day no matter how much it holds; a
-   day's distribution is computed once and never changes afterwards.
-   Every reward amount is FRG (CW20, 6 decimals) — see the
+3. Each registered wallet is **owed a percentage of its own FRG
+   balance**, from the **tier table** (owner-set): each tier is a
+   minimum FRG held plus a daily percentage; a wallet's tier is the
+   highest tier whose minimum its snapshot balance meets (a balance
+   exactly at a minimum gets that tier; the base tier's minimum is
+   0, so every holder has a tier). No crowd split, no time bonuses,
+   no duration multipliers, no loyalty weighting. Defaults: no tiers
+   beyond the base tier at 0% — the program is OFF until the owner
+   sets real tier numbers. Changing tiers never alters a recorded
+   day. Every reward amount is FRG (CW20, 6 decimals) — see the
    reward-currency migrations below.
-4. The holder clicks **Collect**. The backend recomputes what they are
-   owed from snapshots minus what they have already been paid, and
-   pays that FRG from the **payout wallet** by CW20 transfer. The
-   frontend never decides an amount — any amount it sends is ignored.
+3b. A **daily cap of $0.50 total across ALL holders** (owner-set,
+   stored in USD) bounds each run: the cap is converted to FRG at
+   the run's **live price** (FRG/LUNC pair reserves via LCD +
+   LUNC/USD via CoinPaprika — see `price.js`; the FRG amount is
+   never hard-coded). If total owed exceeds the cap, all payments
+   scale down pro-rata so the day pays exactly the cap; if owed is
+   under the cap, owed amounts pay in full. **A price-feed failure
+   halts the run and pays nothing — a price is never guessed.**
+   Cap 0 = off.
+4. At the end of the day the system computes the payout table; the
+   **owner reviews it in the admin panel and presses the payout
+   button** — only then do sends go out, automatically, from the
+   **payout wallet** by CW20 transfer (one run per day, every
+   payment recorded with its tx hash; re-presses never double-pay).
+   **No timer ever sends.** Sub-dust rule: a wallet owed less than
+   1 FRG in total is not sent a micro-payment; the amount stays
+   accrued (carried) and pays out once its combined claimable
+   reaches 1 FRG.
 
 ## Safety rules (non-negotiable, enforced in code)
 
 - **No holder's FRG ever leaves their own wallet.** The ONLY wallet
   that ever sends is the payout wallet.
-- **The backend never pays more than the payout wallet's actual FRG
-  balance.** If the payout wallet is short of FRG, Collect fails with
-  "rewards pool empty, top up" and nothing is recorded as paid.
-- **Every Collect is verified server-side** from snapshots + the
-  payment ledger. One wallet's claim can never exceed its own
-  accrued-minus-paid, and a double-Collect pays only once.
-- **Crash-safe payments:** a Collect first writes a `pending` payment
-  row (pending counts as paid), then sends, then confirms. A crash
-  between send and confirm can never double-pay; a failed send voids
-  the pending row and the rewards stay collectable.
+- **The pool only ever pays what is owed — it does not empty by
+  design.** Total paid per run never exceeds the payout wallet's
+  actual FRG balance: if total owed ever exceeds the balance, sends
+  scale down pro-rata to exactly the balance, the shortfall is
+  recorded in the run record, and the unpaid remainder stays owed
+  (claimable) for a later press after top-up.
+- **Every payout is computed server-side** from registrations,
+  snapshots, and the payment ledger. The frontend never decides an
+  amount.
+- **Crash-safe payments:** each send first writes a `pending`
+  payment row (pending counts as paid), then sends, then confirms.
+  A crash between send and confirm can never double-pay; a failed
+  send voids the pending row and the amount stays owed.
 - **Idempotent snapshots:** running a day's snapshot twice records it
   once. A failed snapshot (e.g. an LCD error) records nothing at all.
 - **Affiliate bonus is EXTRA, funded from the same reward pot** — never
   deducted from the referral's share or from other holders' shares.
-  Consequence the admin must fund for: **one day's total cost = daily
-  pot + referral bonuses.** The hard cap at payout time is the payout
-  wallet's actual FRG balance.
+  Consequence the admin must fund for: **one day's total cost =
+  the day's owed total (bounded by the $0.50 cap) + referral
+  bonuses.** The hard cap at payout time is the payout wallet's
+  actual FRG balance.
 
 ## Reward-currency migrations (two one-time switches, auditable)
 
@@ -147,7 +164,7 @@ Backend (from `server/`):
 
 ```sh
 npm install
-npm test          # 111 tests, must all pass
+npm test          # 114 tests, must all pass
 PORT=3001 node src/server.js
 ```
 
@@ -188,10 +205,10 @@ a single service can host both in production.
    payout wallet). The owner deposits FRG himself. The admin panel
    shows its live FRG balance (the USTC bank balance is also shown,
    labeled as the dormant future option), so a deposit landing is
-   visible before anyone Collects.
+   visible before any payout runs.
 3. Set `ADMIN_SECRET` in Railway (a secret only the owner knows).
-4. With the key absent, Collects fail safely with "payout wallet not
-   configured yet" — no crash, no fake success. With the key present
+4. With the key absent, the payout button fails safely with "payout
+   wallet not configured yet" — no crash, no fake success. With the key present
    but mismatched to `FRG_PAYOUT_ADDRESS`, sending refuses outright
    ("key does not match payout address") before any chain call.
 
@@ -219,25 +236,26 @@ yet — they are env vars with a TODO, not invented values.
 - [ ] Production durable store provisioned (Upstash Redis) and wired in.
 - [ ] `FRG_PAYOUT_MNEMONIC` + `ADMIN_SECRET` set in Railway by the owner.
 - [ ] Payout wallet funded with FRG (reward pool) + LUNC for gas.
-- [ ] WalletConnect metadata URL in `frontend/src/main.jsx` updated
-      from its placeholder to the real deployed URL (currently a
-      `lunc-projects.github.io/frg-hold-earn/` placeholder — NOT live).
+- [x] Wallet connect REMOVED entirely (owner, 2026-11-05): the app
+      is paste-only; no WalletConnect, no connect button, no signing
+      anywhere. The page carries the copycat warning: a version that
+      asks to connect or sign is a fake.
 - [ ] Affiliate design session with the owner (rate, rules, wording)
       — the 10% default is proposed, not final.
-- [ ] Daily pot set by the owner **in FRG** (migration #2 reset it
-      to 0 — rewards honestly show "not started yet" until the owner
-      sets the FRG/day pot amount; this is the one number left).
+- [ ] Tier table set by the owner (percentages per tier — ships at
+      0%, program off, until he sets real numbers). The daily cap
+      ships at his chosen $0.50/day total.
 
 ## Project layout
 
 ```text
 frg-hold-earn/
   README.md
-  frontend/            # Vite + React + Cosmos Kit (Keplr / Station /
-                       # Keplr Mobile / Galaxy Station via WalletConnect)
+  frontend/            # Vite + React — PASTE-ONLY, no wallet libraries
     src/
-      main.jsx         # Cosmos Kit provider (WC metadata URL = TODO)
-      App.jsx          # holdings / rewards / Collect / referrals / admin
+      main.jsx         # plain React root — no wallet providers
+      App.jsx          # paste-register / holdings / rewards /
+                       # tiers / referrals / admin + payout button
       config.js        # FRG token, admin fallback, LCD/RPC/Finder
       chainDef.js wallets.js polyfills.js   # copied LNC-app pattern
       lib/api.js       # backend calls + direct LCD balance
@@ -249,12 +267,14 @@ frg-hold-earn/
       store.js         # SQLite storage module (node:sqlite)
       assets.js        # the ONE reward-asset descriptor (FRG live;
                        # USTC dormant future option)
+      price.js         # live FRG/USD (pair reserves + CoinPaprika)
+                       # for the $0.50/day cap conversion
       payout.js        # the ONLY sender (base rewards route through
                        # the descriptor: FRG CW20 today; the USTC
                        # native bank-send path stays, dormant)
     tests/
       engine.test.js store.test.js collect.test.js payout.test.js
-      sampling.test.js nft.test.js migration.test.js
+      payout-run.test.js sampling.test.js nft.test.js migration.test.js
 ```
 
 ## Design note
@@ -278,7 +298,7 @@ Holders who also hold FRG NFTs earn extra bonus rewards on top:
   the admin panel). Daily bonus = NFT count × bonus per NFT, accrued
   during the same daily snapshot that records base rewards.
 - **Bonus pool:** a SEPARATE ledger from the daily pool, funded by
-  mint fees. Bonus Collect reuses the base Collect safety pattern
+  mint fees. Bonus Collect reuses the base payment safety pattern
   (pending counts as paid, failed send voids and stays collectable)
   and never pays more than the tracked bonus pool balance. Sends go
   out through the payout wallet (the only key on the server); the
@@ -288,13 +308,12 @@ Holders who also hold FRG NFTs earn extra bonus rewards on top:
   threshold, supply cap, bonus pool wallet. Invalid numbers are
   rejected with a visible error.
 - **Honesty rules:** until a real collection address is configured,
-  bonus holdings read as zero and minting shows as not open — there
-  is no button that pretends to mint. Minting (once configured) is a
-  real wallet-signed CW20 send from the connected wallet to the
-  collection with a `{"mint":{}}` message; the app checks the
-  collection contract's config (price, fee recipient, sold-out state)
-  before signing, and the backend verifies the fee transfer on-chain
-  before crediting the tracked bonus pool.
+  bonus holdings read as zero. NOTE (2026-11-05): the app is now
+  paste-only — it cannot sign a mint. The mint-record endpoint and
+  its on-chain verification remain server-side, but in-app minting
+  is unavailable until/unless the owner chooses a signing route;
+  the frontend offers no mint button rather than one that cannot
+  work.
 - **No other bonuses:** no PvP steal, no grid bonuses, no top-10
   airdrops. Only this mechanic.
 - **Collection contract:** `contracts/frg-nft/` — a standard CW721

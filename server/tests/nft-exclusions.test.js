@@ -111,11 +111,11 @@ test('snapshot: excluded holder records 0, accrues 0, is never chain-read; base 
     // Non-excluded: completely unaffected (2 NFTs x 2 FRG = 4 FRG).
     assert.equal(store.latestNftCount(B), 2);
     assert.equal(store.nftAccrued(B), 4_000_000n);
-    // Base hold-and-earn accrues normally for BOTH (equal balances earn
-    // equally; the day's pot splits evenly between them).
-    assert.equal(store.accrued(A), 500_000n);
-    assert.equal(store.accrued(B), 500_000n);
-    assert.deepEqual(store.snapshotDays(), ['2026-10-28']);
+    // Base hold-and-earn is payout-run-only now: the NFT snapshot
+    // records no base day and accrues no base for anyone.
+    assert.equal(store.accrued(A), 0n);
+    assert.equal(store.accrued(B), 0n);
+    assert.deepEqual(store.snapshotDays(), []);
     assert.deepEqual(store.nftSnapshotDays(), ['2026-10-28']);
   } finally { global.fetch = realFetch; }
 });
@@ -159,11 +159,11 @@ test('snapshot: LCD failure still skips the whole NFT day when an exclusion is s
   try {
     out = await runSnapshot(store, async () => 1_000_000n, '2026-10-28', fetchNftCount);
   } finally { global.fetch = realFetch; }
-  // Base completed for both; NFT day skipped as a whole (nothing
-  // partial recorded for anyone, excluded or not).
-  assert.deepEqual(store.snapshotDays(), ['2026-10-28']);
-  assert.equal(store.accrued(A), 500_000n);
-  assert.equal(store.accrued(B), 500_000n);
+  // NFT day skipped as a whole (nothing partial recorded for
+  // anyone, excluded or not). Base is payout-run-only: untouched.
+  assert.deepEqual(store.snapshotDays(), []);
+  assert.equal(store.accrued(A), 0n);
+  assert.equal(store.accrued(B), 0n);
   assert.equal(out.nft.skipped, true);
   assert.deepEqual(store.nftSnapshotDays(), []);
   assert.equal(store.nftAccrued(B), 0n);

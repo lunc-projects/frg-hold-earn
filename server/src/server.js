@@ -1,13 +1,18 @@
 // ─────────────────────────────────────────────────────────────
 // FRG Hold & Earn — backend API.
-// Holders NEVER send anything: they connect, the server snapshots
-// their FRG balance daily, and they collect rewards in the LIVE
-// reward asset (assets.js — FRG since migration #2, owner ruling
-// 2026-11-05; USTC remains the dormant future option). Model: each
-// day is its own round — the daily pot empties to the wallets that
-// REGISTERED that day, pro-rata by their snapshot FRG balances
-// (see engine.js). The ONLY wallet that ever sends is the payout
-// wallet (payout.js).
+// Holders NEVER send anything and NEVER connect a wallet: they
+// PASTE their address (paste-only app — a version asking to
+// connect or sign is a fake). Pasting registers the wallet; a
+// payout run includes the wallets registered within the 24 hours
+// before the run. Each is owed its TIER percentage of its own FRG
+// balance (engine.js tier table), the day's total is bounded by
+// the $0.50/day cap converted at the run's live price, and the
+// pool only ever pays what is owed. Sends happen ONLY when the
+// owner presses the payout button (review-before-press) — no
+// timer ever sends. Rewards are the LIVE reward asset (assets.js
+// — FRG since migration #2; USTC remains the dormant future
+// option). The ONLY wallet that ever sends is the payout wallet
+// (payout.js).
 //
 // Admin auth (v1, stated limitation — see README):
 // admin endpoints require BOTH headers:
@@ -27,8 +32,10 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { openStore } from './store.js';
 import {
-  computeDay, isValidTerraAddress, parseWholeToBase, formatBaseToWhole,
+  computeOwed, computeBonuses, scaleAmountsToLimit, normalizeTiers,
+  MIN_PAYOUT_BASE, isValidTerraAddress, parseWholeToBase, formatBaseToWhole,
 } from './engine.js';
+import { fetchFrgUsdPrice, capBaseForUsd, frgUsdPrice } from './price.js';
 import { rewardAssetFor } from './assets.js';
 import { createPayout, cw20Balance, FRG_TOKEN } from './payout.js';
 import {
@@ -51,57 +58,18 @@ export function dayString(d = new Date()) {
   return d.toISOString().slice(0, 10); // UTC day
 }
 
-// Runs one day's snapshot + accrual. Idempotent: a second run for the
-// same day is a no-op (store.recordDay refuses a duplicate day). ONLY
-// the wallets that REGISTERED for this day take part: the day's pot
-// splits pro-rata across their FRG snapshot balances and empties
-// completely (engine.js pot model); accruals are reward-asset base
-// units. Wallets bound in the wallets table but not registered for
-// this day are not snapshotted for the base split at all.
-// Balance accuracy (2026-10-25): each wallet's split weight is its
-// AVERAGE sampled balance for the day (hourly samples, see
-// runBalanceSampling) — holding FRG for one hour earns ~1/24 of the
-// weight of holding it all day, so flash-holding into the snapshot
-// moment no longer pays. A wallet with no samples that day (e.g. the
-// sampler was down, or it registered after the last sample) falls
-// back to a live balance read, exactly the pre-upgrade behavior.
-// fetchNftCounts (optional): when given, the same day also snapshots
-// each wallet's consolidated NFT counts across the configured bonus
-// collections — broken down BY TYPE (bonus / common / uncommon, see
-// classifyNftType) — and accrues NFT bonuses at the per-type rates
-// into the SEPARATE nft ledger. A fetcher returning a plain number
-// is the pre-type contract: every token counts as the default type.
-// When omitted (old callers, tests), the NFT side is skipped entirely
-// — base behavior unchanged. If any NFT read FAILS (e.g. the LCD is
-// down), the NFT day is skipped as a whole — no partial counts are
-// ever recorded — and the base snapshot still completes; the NFT day
-// can simply be recorded by a later run the same day.
-// Wallets on the admin-set exclusion list (nft_excluded_wallets, e.g.
-// the owner's own bonus-stock wallet) are recorded with NFT counts
-// of 0 WITHOUT any chain read and never accrue NFT bonus; their base
-// rewards above are completely unaffected.
+// NFT-side snapshot ONLY (base rewards no longer snapshot-accrue
+// here — they are computed and paid by the owner-pressed payout
+// run, see runPayoutDay). Snapshots each bound wallet's
+// consolidated NFT counts across the configured bonus collections
+// — broken down BY TYPE — and accrues NFT bonuses at the per-type
+// rates into the SEPARATE nft ledger. Idempotent per day. If any
+// NFT read FAILS, the NFT day is skipped as a whole (no partial
+// counts) and can be recorded by a later run the same day.
+// Wallets on the exclusion list record 0 WITHOUT any chain read
+// and never accrue NFT bonus.
 export async function runSnapshot(store, fetchBalance, day = dayString(), fetchNftCounts = null) {
   const wallets = store.allWallets();
-  // The day's round = the wallets that registered FOR THIS DAY.
-  const participants = new Set(store.dayRegistrations(day));
-  const averages = store.averageBalances(day);
-  const balances = [];
-  let averaged = 0;
-  for (const w of wallets) {
-    if (!participants.has(w.address)) continue;
-    const a = averages.get(w.address);
-    if (a) {
-      balances.push({ wallet: w.address, balance: a.average });
-      averaged++;
-    } else {
-      balances.push({ wallet: w.address, balance: await fetchBalance(w.address) });
-    }
-  }
-  const pot = store.getDailyPool();
-  const referralOf = new Map(wallets.map((w) => [w.address, w.referrer]));
-  const { shares, bonuses } = computeDay(pot, balances, referralOf, store.getAffiliateRateBps());
-  const result = store.recordDay(day, pot, balances, shares, bonuses);
-  const total = balances.reduce((s, b) => s + b.balance, 0n);
   let nftOut = null;
   if (fetchNftCounts) {
     try {
@@ -119,19 +87,209 @@ export async function runSnapshot(store, fetchBalance, day = dayString(), fetchN
       }));
       nftOut = store.recordNftDay(day, nftCounts, nftBonuses);
     } catch (e) {
-      // Bonus read failed: skip the NFT day entirely (nothing partial
-      // is recorded, so a retry today can still land it). The base
-      // snapshot above is already recorded and is never affected.
       nftOut = { skipped: true, error: `NFT bonus snapshot skipped: ${e.message}` };
     }
   }
+  return { day, wallets: wallets.length, nft: nftOut, base: 'payout-run-only' };
+}
+
+export const REGISTRATION_WINDOW_MS = 24 * 60 * 60 * 1000;
+
+// Builds the payout table for a run at `now` WITHOUT recording or
+// sending anything (the admin preview and the dry run use this;
+// the payout press uses the same builder, so what the owner
+// reviews is exactly what the press computes).
+// Participants: wallets whose paste-registration timestamp is in
+// the rolling 24h window (now-24h, now]. Balances: the day's
+// AVERAGE sampled balance when samples exist (hourly sampler —
+// flash-holding earns ~1/24 weight per hour), else a live read.
+// Owed: tier % × balance (engine). Cap: when the USD cap is on and
+// anything is owed, the price is fetched LIVE — a price failure
+// throws (the caller halts the run; a price is never guessed).
+export async function buildPayoutTable(store, fetchBalance, { now = new Date(), priceFeed } = {}) {
+  const windowEnd = now.getTime();
+  const windowStart = windowEnd - REGISTRATION_WINDOW_MS;
+  const regs = store.registrationsWithin(windowStart, windowEnd);
+  const day = dayString(now);
+  const averages = store.averageBalances(day);
+  const balances = [];
+  let averaged = 0;
+  for (const r of regs) {
+    const a = averages.get(r.wallet);
+    if (a) { balances.push({ wallet: r.wallet, balance: a.average }); averaged++; }
+    else balances.push({ wallet: r.wallet, balance: await fetchBalance(r.wallet) });
+  }
+  const tiers = store.getRewardTiers();
+  const owedRows = computeOwed(balances, tiers);
+  const totalOwed = owedRows.reduce((s, r) => s + r.owed, 0n);
+  const capUsdMicro = store.getDailyCapUsdMicro();
+  let price = null;
+  let capBase = null;
+  let scaledToCap = false;
+  let rows = owedRows.map((r) => ({ ...r, scaled: r.owed }));
+  if (capUsdMicro > 0n && totalOwed > 0n) {
+    if (!priceFeed) throw new Error('price feed unavailable');
+    price = await priceFeed(); // throws on any source failure -> halt
+    capBase = capBaseForUsd(capUsdMicro, price);
+    if (totalOwed > capBase) {
+      scaledToCap = true;
+      const scaled = scaleAmountsToLimit(
+        owedRows.map((r) => ({ ...r, amount: r.owed })), capBase);
+      rows = scaled.map((r) => ({ ...r, scaled: r.amount }));
+    }
+  }
+  const totalScaled = rows.reduce((s, r) => s + r.scaled, 0n);
   return {
-    day, wallets: balances.length, totalBalance: total.toString(),
-    pool: pot.toString(), pot: pot.toString(),
-    registered: participants.size,
-    ...result, nft: nftOut,
-    balanceSource: { averaged, live: balances.length - averaged },
+    day, windowStart, windowEnd, registeredCount: regs.length,
+    rows, totalOwed, totalScaled, capUsdMicro, capBase, price, scaledToCap,
+    tiers, balanceSource: { averaged, live: balances.length - averaged },
   };
+}
+
+// THE owner-pressed payout run. One run per day:
+// 1. If the day is not recorded yet, the table is built (above)
+//    and the day's accruals are recorded ONCE from the scaled
+//    amounts (frozen forever — later tier changes or registrations
+//    can never alter a recorded day). A price failure at this
+//    point HALTS the run: a 'halted_price' run record is saved,
+//    nothing is recorded, nothing is paid.
+// 2. Pay phase: each participant's CLAIMABLE (all accruals minus
+//    all payments — so carried sub-dust amounts from earlier days
+//    join in) is sent via the payout wallet's reward path, when it
+//    reaches MIN_PAYOUT_BASE (1 FRG); below that it stays accrued
+//    (carried). POOL GUARD: if the total to send exceeds the
+//    payout wallet's actual FRG balance, sends scale down
+//    pro-rata to exactly the balance; the unpaid remainder stays
+//    claimable and the shortfall is recorded in the run record.
+// 3. Every send is a pending -> confirmed payment row with its tx
+//    hash; a failed send voids its row and is reported, never
+//    faked. Re-pressing the same day pays only what is still
+//    claimable — a wallet can never be paid twice for a day.
+export async function runPayoutDay(store, payout, fetchBalance, { now = new Date(), priceFeed } = {}) {
+  const day = dayString(now);
+  const capUsdMicro = store.getDailyCapUsdMicro();
+  let table = null;
+  if (!store.dayRecorded(day)) {
+    try {
+      table = await buildPayoutTable(store, fetchBalance, { now, priceFeed });
+    } catch (e) {
+      const rec = {
+        day, status: 'halted_price', pressedAt: now.getTime(),
+        windowStart: now.getTime() - REGISTRATION_WINDOW_MS, windowEnd: now.getTime(),
+        registeredCount: store.registrationsWithin(now.getTime() - REGISTRATION_WINDOW_MS, now.getTime()).length,
+        totalOwed: 0n, capBase: null, capUsdMicro, totalPaid: 0n, shortfall: 0n,
+        detail: { rows: [], price: null, error: `payout halted: ${e.message}` },
+      };
+      store.savePayoutRun(rec);
+      return { ...rec, halted: true };
+    }
+    const referralOf = new Map(store.allWallets().map((w) => [w.address, w.referrer]));
+    const bonuses = computeBonuses(
+      table.rows.map(({ wallet, scaled }) => ({ wallet, amount: scaled })),
+      referralOf, store.getAffiliateRateBps());
+    store.recordDay(day, table.totalScaled,
+      table.rows.map(({ wallet, balance }) => ({ wallet, balance })),
+      table.rows.map(({ wallet, scaled }) => ({ wallet, amount: scaled })),
+      bonuses);
+  } else {
+    // Day already recorded (re-press): rebuild the display table
+    // from the frozen record — amounts never recompute.
+    const snaps = store.daySnapshots(day);
+    const tiers = store.getRewardTiers();
+    const owedRows = computeOwed(snaps, tiers);
+    const rows = snaps.map((s) => {
+      const o = owedRows.find((r) => r.wallet === s.wallet);
+      return {
+        wallet: s.wallet, balance: s.balance,
+        minBase: o.minBase, pctBps: o.pctBps, owed: o.owed,
+        scaled: store.accrualForDay(day, s.wallet, 'share'),
+      };
+    });
+    const prev = store.getPayoutRun(day);
+    table = {
+      day, windowStart: prev?.windowStart ?? now.getTime() - REGISTRATION_WINDOW_MS,
+      windowEnd: prev?.windowEnd ?? now.getTime(),
+      registeredCount: prev?.registeredCount ?? rows.length,
+      rows,
+      totalOwed: rows.reduce((s, r) => s + r.owed, 0n),
+      totalScaled: rows.reduce((s, r) => s + r.scaled, 0n),
+      capUsdMicro, capBase: prev?.capBase ?? null, price: null,
+      scaledToCap: false, tiers, balanceSource: { averaged: 0, live: 0 },
+    };
+  }
+
+  // Pay phase.
+  const available = await payout.getRewardBalance();
+  const payList = [];
+  for (const row of table.rows) {
+    const claimable = store.claimable(row.wallet);
+    row.claimable = claimable;
+    if (claimable >= MIN_PAYOUT_BASE) payList.push({ wallet: row.wallet, amount: claimable });
+    row.payStatus = claimable <= 0n ? 'nothing-owed' : claimable < MIN_PAYOUT_BASE ? 'carried-dust' : 'queued';
+  }
+  const totalToSend = payList.reduce((s, p) => s + p.amount, 0n);
+  let shortfall = 0n;
+  let sendList = payList;
+  if (totalToSend > available) {
+    shortfall = totalToSend - available;
+    sendList = available <= 0n ? []
+      : scaleAmountsToLimit(payList.map((p) => ({ ...p })), available);
+  }
+  const sendByWallet = new Map(sendList.map((p) => [p.wallet, p.amount]));
+  let totalPaidThisPress = 0n;
+  const failures = [];
+  for (const row of table.rows) {
+    const amount = sendByWallet.get(row.wallet) || 0n;
+    row.sendAmount = amount;
+    if (amount <= 0n) continue;
+    const paymentId = store.createPendingPayment(row.wallet, amount);
+    try {
+      const txhash = await payout.sendReward(row.wallet, amount);
+      store.confirmPayment(paymentId, txhash);
+      row.txhash = txhash;
+      row.payStatus = amount < row.claimable ? 'paid-partial-pool' : 'paid';
+      totalPaidThisPress += amount;
+    } catch (e) {
+      store.voidPayment(paymentId);
+      row.payStatus = 'send-failed';
+      row.error = e.message;
+      failures.push(row.wallet);
+    }
+  }
+  const prev = store.getPayoutRun(day);
+  const totalPaid = (prev && prev.status !== 'halted_price' ? prev.totalPaid : 0n) + totalPaidThisPress;
+  const status = failures.length
+    ? 'partial'
+    : shortfall > 0n
+      ? (totalPaidThisPress > 0n ? 'partial_pool' : 'pool_empty')
+      : 'completed';
+  const rec = {
+    day, status, pressedAt: now.getTime(),
+    windowStart: table.windowStart, windowEnd: table.windowEnd,
+    registeredCount: table.registeredCount,
+    totalOwed: table.totalOwed, capBase: table.capBase, capUsdMicro,
+    totalPaid, shortfall,
+    detail: {
+      rows: table.rows.map((r) => ({
+        wallet: r.wallet, balance: r.balance.toString(),
+        tierMin: r.minBase.toString(), pctBps: r.pctBps,
+        owed: r.owed.toString(), scaled: r.scaled.toString(),
+        claimable: (r.claimable ?? 0n).toString(),
+        sent: (r.sendAmount ?? 0n).toString(),
+        txhash: r.txhash || null, payStatus: r.payStatus || null,
+        error: r.error || null,
+      })),
+      price: table.price ? {
+        frgUsd: frgUsdPrice(table.price),
+        luncUsdMicro: table.price.luncUsdMicro.toString(),
+        frgReserveBase: table.price.frgReserveBase.toString(),
+        luncReserveBase: table.price.luncReserveBase.toString(),
+      } : null,
+      scaledToCap: table.scaledToCap,
+    },
+  };
+  store.savePayoutRun(rec);
+  return { ...rec, scaledToCap: table.scaledToCap };
 }
 
 // One sampling round: record every registered wallet's current FRG
@@ -233,10 +391,39 @@ export function createApp({ store, payout, config }) {
 
   app.get('/api/health', (_req, res) => res.json({ ok: true }));
 
+  // The payout machinery's injectables: tests pass fakes; production
+  // uses the live LCD balance read + the live price feed.
+  const fetchBalanceLive = config.fetchBalance
+    || ((addr) => cw20Balance(config.lcdUrl, FRG_TOKEN, addr));
+  const priceFeedLive = config.priceFeed
+    || (() => fetchFrgUsdPrice({ lcdUrl: config.lcdUrl }));
+
+  // Tier table as exposed publicly/admin: whole-FRG minimums and
+  // percentages (bps / 100). Public program parameters, not
+  // promises — an individual's owed amount depends on their own
+  // snapshot balance and tier.
+  const tiersView = () => store.getRewardTiers().map((t) => ({
+    minBase: t.minBase.toString(),
+    minWhole: formatBaseToWhole(t.minBase),
+    pctBps: t.pctBps,
+    pct: t.pctBps / 100,
+  }));
+  const capView = () => ({
+    dailyCapUsdMicro: store.getDailyCapUsdMicro().toString(),
+    dailyCapUsd: Number(store.getDailyCapUsdMicro()) / 1_000_000,
+  });
+  const payoutRunView = (run) => (run ? {
+    day: run.day, status: run.status, pressedAt: run.pressedAt,
+    registeredCount: run.registeredCount,
+    totalOwed: run.totalOwed.toString(), totalOwedWhole: formatBaseToWhole(run.totalOwed),
+    capBase: run.capBase === null ? null : run.capBase.toString(),
+    capUsdMicro: run.capUsdMicro.toString(),
+    totalPaid: run.totalPaid.toString(), totalPaidWhole: formatBaseToWhole(run.totalPaid),
+    shortfall: run.shortfall.toString(),
+    detail: run.detail,
+  } : null);
+
   // Public totals — honest numbers straight from the ledger.
-  // The daily pot and affiliate rate are public program parameters,
-  // not promises: an individual's share depends on that day's
-  // registrations and snapshot balances.
   app.get('/api/stats', (_req, res) => res.json({
     holders: store.walletCount(),
     ...rewardMeta,
@@ -246,13 +433,13 @@ export function createApp({ store, payout, config }) {
     snapshotDays: store.snapshotDays(),
     // Count only (no balances): proves the hourly sampler is running.
     balanceSamplesToday: store.sampleStats(dayString()).samples,
-    // The DAILY POT: empties to today's registered wallets at the
-    // end of the day. dailyPool is the historical field name.
-    dailyPool: store.getDailyPool().toString(),
-    dailyPoolWhole: formatBaseToWhole(store.getDailyPool()),
-    dailyPot: store.getDailyPool().toString(),
-    dailyPotWhole: formatBaseToWhole(store.getDailyPool()),
-    registeredToday: store.dayRegistrations(dayString()).length,
+    // The tier table + daily cap are the program's public shape.
+    rewardTiers: tiersView(),
+    ...capView(),
+    // Wallets registered inside the rolling 24h window right now —
+    // the count the next payout run will include.
+    registeredLast24h: store.registrationsWithin(Date.now() - REGISTRATION_WINDOW_MS, Date.now()).length,
+    lastPayoutRun: payoutRunView(store.latestPayoutRun()),
     affiliateRatePercent: store.getAffiliateRateBps() / 100,
     // NFT section (additive — base stats above are untouched).
     nft: (() => {
@@ -289,10 +476,13 @@ export function createApp({ store, payout, config }) {
     }
   });
 
-  // Registration: first-touch wins, binding immutable (store
-  // enforces). Registering ALSO enters the wallet in TODAY's round
-  // (the daily pot split) — that part is per-day and must be
-  // repeated each day; the referral binding never changes.
+  // Registration: THE paste path (the app is paste-only — no
+  // wallet connect exists). Pasting a valid address registers it:
+  // the first-touch referral binding is recorded (immutable), and
+  // the registration TIMESTAMP is set/refreshed — a payout run
+  // includes the wallet iff the timestamp is within the 24 hours
+  // before the run. Invalid addresses are rejected with a plain
+  // error; nothing is recorded for them.
   app.post('/api/register', (req, res) => {
     const addr = validAddr(req, res); if (!addr) return;
     const referrer = (req.body?.referrer || '').trim() || null;
@@ -301,20 +491,22 @@ export function createApp({ store, payout, config }) {
       if (referrer === addr) return bad(res, 400, 'referrer cannot be your own wallet');
     }
     const out = store.registerWallet(addr, referrer);
-    const day = dayString();
-    const reg = store.registerForDay(day, addr);
-    res.json({ ...out, day, registeredForDay: true, alreadyRegisteredToday: reg.alreadyRegistered });
+    const reg = store.recordRegistration(addr, Date.now());
+    res.json({ ...out, registeredAt: reg.registeredAt, windowHours: 24 });
   });
 
   app.get('/api/rewards', (req, res) => {
     const addr = validAddr(req, res); if (!addr) return;
     const accrued = store.accrued(addr);
     const paid = store.paid(addr);
+    const registeredAt = store.registrationFor(addr);
     res.json({
       address: addr,
       ...rewardMeta,
-      // Is this wallet in TODAY's round? Registration is per-day.
-      registeredToday: store.isRegisteredForDay(dayString(), addr),
+      // Is this wallet inside the rolling 24h window right now?
+      registeredAt,
+      registeredInWindow: registeredAt !== null
+        && registeredAt > Date.now() - REGISTRATION_WINDOW_MS,
       accrued: accrued.toString(), accruedWhole: formatBaseToWhole(accrued),
       paid: paid.toString(), paidWhole: formatBaseToWhole(paid),
       claimable: store.claimable(addr).toString(),
@@ -541,13 +733,10 @@ export function createApp({ store, payout, config }) {
       totalAccrued: store.totalAccrued().toString(),
       totalPaid: store.totalPaid().toString(),
       snapshotDays: store.snapshotDays(),
-      // dailyPool = the DAILY POT (empties to the day's registered
-      // wallets). dailyPot is the same number under its plain name.
-      dailyPool: store.getDailyPool().toString(),
-      dailyPoolWhole: formatBaseToWhole(store.getDailyPool()),
-      dailyPot: store.getDailyPool().toString(),
-      dailyPotWhole: formatBaseToWhole(store.getDailyPool()),
-      registeredToday: store.dayRegistrations(dayString()).length,
+      rewardTiers: tiersView(),
+      ...capView(),
+      registeredLast24h: store.registrationsWithin(Date.now() - REGISTRATION_WINDOW_MS, Date.now()).length,
+      lastPayoutRun: payoutRunView(store.latestPayoutRun()),
       affiliateRateBps: store.getAffiliateRateBps(),
       affiliateRatePercent: store.getAffiliateRateBps() / 100,
       payoutCanSend: payout.configured,
@@ -583,20 +772,91 @@ export function createApp({ store, payout, config }) {
     });
   });
 
-  // Sets the DAILY POT (the daily_pool setting): the FRG amount
-  // that empties to each day's registered wallets at the end of
-  // the day. 0 = rounds off. This is the owner's one number.
-  app.post('/api/admin/pool', requireAdmin, (req, res) => {
+  // Sets the TIER TABLE: [{minWhole, pct}] — minimum FRG held and
+  // the daily percentage owed for that tier. The base tier
+  // (minimum 0) is always present after normalization. Changing
+  // tiers never alters a recorded day: recorded days pay from
+  // their frozen accruals.
+  app.post('/api/admin/tiers', requireAdmin, (req, res) => {
     try {
-      const base = parseWholeToBase(req.body?.poolWhole ?? req.body?.pool);
-      if (base < 0n) throw new Error('Invalid amount');
-      store.setDailyPool(base);
-      res.json({
-        dailyPool: base.toString(), dailyPoolWhole: formatBaseToWhole(base),
-        dailyPot: base.toString(), dailyPotWhole: formatBaseToWhole(base),
-        ...rewardMeta,
+      const input = req.body?.tiers;
+      if (!Array.isArray(input)) throw new Error('tiers must be a list');
+      const tiers = input.map((t) => {
+        const pct = Number(t?.pct);
+        if (!Number.isFinite(pct) || pct < 0 || pct > 100) throw new Error('tier pct must be 0–100');
+        const bps = Math.round(pct * 100);
+        if (Math.abs(pct * 100 - bps) > 1e-9) throw new Error('tier pct supports 2 decimal places');
+        return { minBase: parseWholeToBase(String(t?.minWhole ?? '0')), pctBps: bps };
       });
-    } catch { bad(res, 400, 'invalid pool amount'); }
+      store.setRewardTiers(tiers);
+      res.json({ rewardTiers: tiersView(), ...rewardMeta });
+    } catch (e) { bad(res, 400, e.message || 'invalid tiers'); }
+  });
+
+  // Sets the DAILY CAP in USD (total across ALL holders per day;
+  // owner's number: $0.50). Stored as micro-USD; converted to FRG
+  // at each run's live price. 0 = cap off.
+  app.post('/api/admin/cap', requireAdmin, (req, res) => {
+    try {
+      const usd = Number(req.body?.capUsd);
+      if (!Number.isFinite(usd) || usd < 0 || usd > 1_000_000) throw new Error('cap must be a USD amount ≥ 0');
+      const micro = BigInt(Math.round(usd * 1_000_000));
+      store.setDailyCapUsdMicro(micro);
+      res.json({ ...capView(), ...rewardMeta });
+    } catch (e) { bad(res, 400, e.message || 'invalid cap'); }
+  });
+
+  // The payout PREVIEW: exactly the table the press will compute
+  // (same builder), plus the pool's actual balance and the
+  // projected remainder. Records nothing, sends nothing. A price
+  // failure surfaces as 502 — the press would halt the same way.
+  app.get('/api/admin/payout-preview', requireAdmin, async (_req, res) => {
+    try {
+      const table = await buildPayoutTable(store, fetchBalanceLive, { priceFeed: priceFeedLive });
+      let poolBalance = null;
+      try { poolBalance = await payout.getRewardBalance(); } catch { /* show null */ }
+      const totalToSend = table.rows.reduce((s, r) => s + r.scaled, 0n);
+      res.json({
+        day: table.day,
+        windowStart: table.windowStart, windowEnd: table.windowEnd,
+        registeredCount: table.registeredCount,
+        rows: table.rows.map((r) => ({
+          wallet: r.wallet, balance: r.balance.toString(), balanceWhole: formatBaseToWhole(r.balance),
+          tierMinWhole: formatBaseToWhole(r.minBase), pct: r.pctBps / 100,
+          owed: r.owed.toString(), owedWhole: formatBaseToWhole(r.owed),
+          scaled: r.scaled.toString(), scaledWhole: formatBaseToWhole(r.scaled),
+        })),
+        totalOwed: table.totalOwed.toString(), totalOwedWhole: formatBaseToWhole(table.totalOwed),
+        totalScaled: table.totalScaled.toString(), totalScaledWhole: formatBaseToWhole(table.totalScaled),
+        scaledToCap: table.scaledToCap,
+        capUsdMicro: table.capUsdMicro.toString(),
+        dailyCapUsd: Number(table.capUsdMicro) / 1_000_000,
+        capBase: table.capBase === null ? null : table.capBase.toString(),
+        capWhole: table.capBase === null ? null : formatBaseToWhole(table.capBase),
+        priceFrgUsd: table.price ? frgUsdPrice(table.price) : null,
+        poolBalance: poolBalance === null ? null : poolBalance.toString(),
+        poolBalanceWhole: poolBalance === null ? null : formatBaseToWhole(poolBalance),
+        poolRemainder: poolBalance === null ? null : (poolBalance - totalToSend).toString(),
+        poolRemainderWhole: poolBalance === null ? null : formatBaseToWhole(poolBalance - totalToSend),
+        rewardTiers: tiersView(),
+      });
+    } catch (e) {
+      bad(res, 502, `payout preview failed (the press would halt): ${e.message}`);
+    }
+  });
+
+  // THE PAYOUT BUTTON. The owner presses; only then do sends go
+  // out. Idempotent per day (see runPayoutDay). Nothing in the app
+  // sends on a timer.
+  const payoutMutex = createMutex();
+  app.post('/api/admin/payout', requireAdmin, async (_req, res) => {
+    if (!payout.configured) return bad(res, 503, 'payout wallet not configured yet');
+    try {
+      const run = await payoutMutex(() => runPayoutDay(store, payout, fetchBalanceLive, { priceFeed: priceFeedLive }));
+      res.json({ ...payoutRunView(run), scaledToCap: run.scaledToCap ?? null, halted: run.status === 'halted_price' });
+    } catch (e) {
+      bad(res, 502, `payout run failed: ${e.message}`);
+    }
   });
 
   app.post('/api/admin/rate', requireAdmin, (req, res) => {

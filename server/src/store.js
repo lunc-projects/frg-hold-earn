@@ -18,7 +18,7 @@
 // swapping the backend later does not touch the earnings logic.
 // ─────────────────────────────────────────────────────────────
 import { DatabaseSync } from 'node:sqlite';
-import { isValidTerraAddress, isValidTerraContractAddress } from './engine.js';
+import { isValidTerraAddress, isValidTerraContractAddress, normalizeTiers } from './engine.js';
 import { FRG_TOKEN } from './assets.js';
 
 export function openStore(path) {
@@ -34,6 +34,25 @@ export function openStore(path) {
     CREATE TABLE IF NOT EXISTS day_registrations(
       day TEXT, wallet TEXT, registered_at INTEGER,
       PRIMARY KEY(day, wallet));
+    -- Paste registrations (owner's final model, 2026-11-05): one
+    -- row per wallet with the LAST time it registered (pasting
+    -- again refreshes the timestamp). A payout run includes a
+    -- wallet iff its timestamp is within the 24 hours before the
+    -- run — the rolling eligibility window.
+    CREATE TABLE IF NOT EXISTS registrations(
+      wallet TEXT PRIMARY KEY, registered_at INTEGER);
+    -- Owner-pressed payout runs: one record per day, written when
+    -- the owner presses the payout button. The record is the audit
+    -- trail of the run: window, registrations counted, tier table
+    -- and price used, cap, totals owed/paid, shortfall, and the
+    -- per-wallet detail (JSON). Re-presses update the same record;
+    -- payments themselves live in the payments table and net
+    -- against accruals, so a re-press can never double-pay.
+    CREATE TABLE IF NOT EXISTS payout_runs(
+      day TEXT PRIMARY KEY, status TEXT, pressed_at INTEGER,
+      window_start INTEGER, window_end INTEGER, registered_count INTEGER,
+      total_owed TEXT, cap_base TEXT, cap_usd_micro TEXT,
+      total_paid TEXT, shortfall TEXT, detail TEXT);
     CREATE TABLE IF NOT EXISTS snapshots(
       day TEXT, wallet TEXT, balance TEXT,
       PRIMARY KEY(day, wallet));
@@ -100,6 +119,12 @@ export function openStore(path) {
   // until the owner sets the pot amount (engine.js pot model).
   db.prepare(`INSERT OR IGNORE INTO settings(key, value)
               VALUES('daily_pool', '0'), ('affiliate_rate_bps', '1000')`).run();
+  // Final-model defaults (owner, 2026-11-05): the tier table ships
+  // EMPTY (only the implicit base tier at 0% — the program is off
+  // until the owner sets real tiers), and the daily cap ships at
+  // the owner's chosen $0.50 (micro-USD) total across all holders.
+  db.prepare(`INSERT OR IGNORE INTO settings(key, value)
+              VALUES('reward_tiers', '[]'), ('daily_cap_usd_micro', '500000')`).run();
   // NFT defaults (only when never set): no collection configured
   // (bonus holdings read as zero), mint cost 0, threshold 0 (unset),
   // supply cap 0 (unlimited), no bonus pool wallet (bonus payouts
@@ -352,6 +377,107 @@ export function openStore(path) {
     dayRegistrations(day) {
       return all(`SELECT wallet FROM day_registrations WHERE day = ? ORDER BY wallet`, day)
         .map((r) => r.wallet);
+    },
+
+    // --- Paste registrations (rolling 24h eligibility window) ---
+    // Pasting an address registers it; pasting again REFRESHES the
+    // timestamp. A payout run at time T includes exactly the
+    // wallets with windowStart < registered_at <= T, where
+    // windowStart = T - 24h (server.js builds the window).
+    recordRegistration(address, ts = Date.now()) {
+      run(`INSERT INTO registrations(wallet, registered_at) VALUES(?, ?)
+           ON CONFLICT(wallet) DO UPDATE SET registered_at = excluded.registered_at`,
+          address, ts);
+      return { wallet: address, registeredAt: ts };
+    },
+    registrationFor(address) {
+      const r = q(`SELECT registered_at FROM registrations WHERE wallet = ?`, address);
+      return r ? r.registered_at : null;
+    },
+    registrationsWithin(windowStart, windowEnd) {
+      return all(`SELECT wallet, registered_at FROM registrations
+                  WHERE registered_at > ? AND registered_at <= ? ORDER BY wallet`,
+                 windowStart, windowEnd)
+        .map((r) => ({ wallet: r.wallet, registeredAt: r.registered_at }));
+    },
+
+    // --- Reward tiers + daily cap (owner's final model) ---
+    // Tiers are stored as JSON [{minBase: string, pctBps: number}]
+    // and always read back through normalizeTiers (base tier at
+    // minimum 0 guaranteed). The OWNER sets the real numbers.
+    getRewardTiers() {
+      let raw = [];
+      try {
+        const r = q(`SELECT value FROM settings WHERE key = 'reward_tiers'`);
+        const parsed = r ? JSON.parse(r.value) : [];
+        if (Array.isArray(parsed)) raw = parsed;
+      } catch { raw = []; }
+      return normalizeTiers(raw);
+    },
+    setRewardTiers(tiers) {
+      const table = normalizeTiers(tiers);
+      run(`INSERT INTO settings(key, value) VALUES('reward_tiers', ?)
+           ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+          JSON.stringify(table.map((t) => ({ minBase: t.minBase.toString(), pctBps: t.pctBps }))));
+      return table;
+    },
+    // Daily cap in micro-USD (1e6 = $1). Owner's number: $0.50
+    // total per day across ALL holders. 0 = cap off.
+    getDailyCapUsdMicro() {
+      const r = q(`SELECT value FROM settings WHERE key = 'daily_cap_usd_micro'`);
+      return r ? BigInt(r.value) : 0n;
+    },
+    setDailyCapUsdMicro(micro) {
+      run(`INSERT INTO settings(key, value) VALUES('daily_cap_usd_micro', ?)
+           ON CONFLICT(key) DO UPDATE SET value = excluded.value`, String(micro));
+    },
+
+    // --- Payout runs (owner-pressed, one record per day) ---
+    savePayoutRun(rec) {
+      run(`INSERT INTO payout_runs(day, status, pressed_at, window_start, window_end,
+             registered_count, total_owed, cap_base, cap_usd_micro, total_paid, shortfall, detail)
+           VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(day) DO UPDATE SET status = excluded.status,
+             pressed_at = excluded.pressed_at, window_start = excluded.window_start,
+             window_end = excluded.window_end, registered_count = excluded.registered_count,
+             total_owed = excluded.total_owed, cap_base = excluded.cap_base,
+             cap_usd_micro = excluded.cap_usd_micro, total_paid = excluded.total_paid,
+             shortfall = excluded.shortfall, detail = excluded.detail`,
+          rec.day, rec.status, rec.pressedAt, rec.windowStart, rec.windowEnd,
+          rec.registeredCount, String(rec.totalOwed), rec.capBase === null ? null : String(rec.capBase),
+          String(rec.capUsdMicro), String(rec.totalPaid), String(rec.shortfall),
+          JSON.stringify(rec.detail || []));
+    },
+    _payoutRunRow(r) {
+      if (!r) return null;
+      return {
+        day: r.day, status: r.status, pressedAt: r.pressed_at,
+        windowStart: r.window_start, windowEnd: r.window_end,
+        registeredCount: r.registered_count,
+        totalOwed: BigInt(r.total_owed),
+        capBase: r.cap_base === null ? null : BigInt(r.cap_base),
+        capUsdMicro: BigInt(r.cap_usd_micro),
+        totalPaid: BigInt(r.total_paid),
+        shortfall: BigInt(r.shortfall),
+        detail: JSON.parse(r.detail || '[]'),
+      };
+    },
+    getPayoutRun(day) {
+      return this._payoutRunRow(q(`SELECT * FROM payout_runs WHERE day = ?`, day));
+    },
+    latestPayoutRun() {
+      return this._payoutRunRow(q(`SELECT * FROM payout_runs ORDER BY day DESC LIMIT 1`));
+    },
+    dayRecorded(day) {
+      return Boolean(q(`SELECT day FROM day_pools WHERE day = ?`, day));
+    },
+    daySnapshots(day) {
+      return all(`SELECT wallet, balance FROM snapshots WHERE day = ? ORDER BY wallet`, day)
+        .map((r) => ({ wallet: r.wallet, balance: BigInt(r.balance) }));
+    },
+    accrualForDay(day, wallet, kind = 'share') {
+      const r = q(`SELECT amount FROM accruals WHERE day = ? AND wallet = ? AND kind = ?`, day, wallet, kind);
+      return r ? BigInt(r.amount) : 0n;
     },
     getAffiliateRateBps() { return Number(q(`SELECT value FROM settings WHERE key='affiliate_rate_bps'`).value); },
     setAffiliateRateBps(bps) {
