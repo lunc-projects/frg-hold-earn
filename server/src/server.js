@@ -11,9 +11,12 @@
 // owner set (USD — currently $0.50 total — converted to FRG at
 // the run's live price), bounded by a HARD LIMIT of 2,000 FRG/day
 // and by the pool's actual balance, and split SIMPLE PRO-RATA by
-// holdings (engine.js computeSplit — no tiers). Sends happen ONLY
+// holdings (engine.js computeSplit — no tiers). Sends happen
 // when the owner presses the payout button (review-before-press)
-// — no timer ever sends. Rewards are the LIVE reward asset
+// OR automatically when the split countdown timer reaches zero
+// (auto-pay, owner order 2026-11-07 — see maybeAutoPayout). Every
+// payout send carries the owner's memo (PAYOUT_MEMO, payout.js)
+// so holders see what the FRG is. Rewards are the LIVE reward asset
 // (assets.js — FRG since migration #2; USTC remains the dormant
 // future option). The ONLY wallet that ever sends is the payout
 // wallet (payout.js).
@@ -41,7 +44,7 @@ import {
 } from './engine.js';
 import { fetchFrgUsdPrice, amountBaseForUsd, frgUsdPrice } from './price.js';
 import { rewardAssetFor } from './assets.js';
-import { createPayout, cw20Balance, bankBalance, FRG_TOKEN } from './payout.js';
+import { createPayout, cw20Balance, bankBalance, FRG_TOKEN, PAYOUT_MEMO, GAS_RESERVE_PER_SEND_ULUNA } from './payout.js';
 import { buildAccounting, accountingToCsv } from './accounting.js';
 import {
   consolidateNftPower, computeNftDailyBonusByType,
@@ -224,7 +227,7 @@ export async function buildPayoutTable(store, fetchBalance, { now = new Date(), 
 //    hash; a failed send voids its row and is reported, never
 //    faked. Re-pressing the same day pays only what is still
 //    claimable — a wallet can never be paid twice for a day.
-export async function runPayoutDay(store, payout, fetchBalance, { now = new Date(), priceFeed } = {}) {
+export async function runPayoutDay(store, payout, fetchBalance, { now = new Date(), priceFeed, memo = PAYOUT_MEMO } = {}) {
   const day = dayString(now);
   const payoutUsdMicro = store.getDailyPayoutUsdMicro();
   let table = null;
@@ -305,6 +308,33 @@ export async function runPayoutDay(store, payout, fetchBalance, { now = new Date
       : scaleAmountsToLimit(payList.map((p) => ({ ...p })), available);
   }
   const sendByWallet = new Map(sendList.map((p) => [p.wallet, p.amount]));
+
+  // LOW-GAS GUARD (owner, 2026-11-07): before ANY send goes out,
+  // the payout wallet's LUNC (gas tank) must cover a per-send
+  // reserve for EVERY send in this run (reserve = the measured
+  // CW20-transfer fee x ~1.5 headroom — see payout.js). If it is
+  // short, the run HALTS with a clear recorded reason and sends
+  // NOTHING — never again a silent all-fail like the 2026-11-07
+  // morning run. Everything stays owed; topping up LUNC and
+  // pressing again pays the same frozen split. A payout object
+  // without a gas read (older fakes) skips the guard.
+  let gasHalt = null;
+  if (sendList.length > 0 && typeof payout.getGasBalance === 'function') {
+    const requiredUluna = GAS_RESERVE_PER_SEND_ULUNA * BigInt(sendList.length);
+    let gasUluna = null;
+    try { gasUluna = await payout.getGasBalance(); } catch { gasUluna = null; }
+    if (gasUluna !== null && gasUluna < requiredUluna) {
+      gasHalt = `payout halted: not enough LUNC for gas — ${sendList.length} send(s) need a `
+        + `${formatBaseToWhole(requiredUluna)} LUNC reserve (${formatBaseToWhole(GAS_RESERVE_PER_SEND_ULUNA)} LUNC per send) `
+        + `but the payout wallet holds ${formatBaseToWhole(gasUluna)} LUNC. Top up LUNC and press again — nothing was sent, everything is still owed.`;
+      for (const row of table.rows) {
+        if ((sendByWallet.get(row.wallet) || 0n) > 0n) row.payStatus = 'halted-gas';
+      }
+      sendList = [];
+      sendByWallet.clear();
+    }
+  }
+
   let totalPaidThisPress = 0n;
   const failures = [];
   for (const row of table.rows) {
@@ -313,7 +343,7 @@ export async function runPayoutDay(store, payout, fetchBalance, { now = new Date
     if (amount <= 0n) continue;
     const paymentId = store.createPendingPayment(row.wallet, amount);
     try {
-      const txhash = await payout.sendReward(row.wallet, amount);
+      const txhash = await payout.sendReward(row.wallet, amount, memo);
       store.confirmPayment(paymentId, txhash);
       row.txhash = txhash;
       row.payStatus = amount < row.claimable ? 'paid-partial-pool' : 'paid';
@@ -326,8 +356,10 @@ export async function runPayoutDay(store, payout, fetchBalance, { now = new Date
     }
   }
   const prev = store.getPayoutRun(day);
-  const totalPaid = (prev && prev.status !== 'halted_price' ? prev.totalPaid : 0n) + totalPaidThisPress;
-  const status = failures.length
+  const totalPaid = (prev && prev.status !== 'halted_price' && prev.status !== 'halted_gas' ? prev.totalPaid : 0n) + totalPaidThisPress;
+  const status = gasHalt
+    ? 'halted_gas'
+    : failures.length
     ? 'partial'
     : shortfall > 0n
       ? (totalPaidThisPress > 0n ? 'partial_pool' : 'pool_empty')
@@ -365,10 +397,43 @@ export async function runPayoutDay(store, payout, fetchBalance, { now = new Date
       splitDeadlineMs: table.splitDeadlineMs ?? null,
       registeredAfterCutoff: table.registeredAfterCutoff ?? 0,
       lateRegistrations: table.lateRegistrations ?? [],
+      // Low-gas halt reason (null unless status is halted_gas).
+      error: gasHalt,
     },
   };
   store.savePayoutRun(rec);
   return rec;
+}
+
+// AUTO-PAY (owner order, 2026-11-07 09:05 ET): when the split
+// countdown timer reaches zero, the day's payout runs by itself —
+// no press needed. The manual press keeps working exactly as
+// before. Semantics:
+// - No timer set, or deadline still in the future: nothing to do.
+// - A run for today that was pressed/executed AT OR AFTER the
+//   deadline already satisfies the day (a press before the
+//   deadline does not: at zero, whatever is still owed goes out).
+// - A price failure inside the run still halts it and pays
+//   nothing (runPayoutDay's halted_price) — auto-pay never
+//   guesses a price. A halted day is retried by later checks the
+//   same day (the halt saved no accruals, so a retry can run).
+// - One run per day is enforced by runPayoutDay itself: a
+//   recorded day pays only what is still claimable, so a second
+//   trigger can never double-pay; the per-day guard below also
+//   stops repeat invocations after a completed/partial run.
+// Returns { ran, reason?, run? } for logging/testing.
+export async function maybeAutoPayout(store, payout, fetchBalance, { now = new Date(), priceFeed } = {}) {
+  const deadlineMs = store.getSplitDeadlineMs();
+  if (!deadlineMs || deadlineMs <= 0) return { ran: false, reason: 'no-timer' };
+  if (now.getTime() < deadlineMs) return { ran: false, reason: 'not-due' };
+  const day = dayString(now);
+  const existing = store.getPayoutRun(day);
+  if (existing && existing.status !== 'halted_price' && existing.status !== 'halted_gas'
+      && existing.pressedAt >= deadlineMs) {
+    return { ran: false, reason: 'already-ran' };
+  }
+  const run = await runPayoutDay(store, payout, fetchBalance, { now, priceFeed });
+  return { ran: true, run };
 }
 
 // One sampling round: record every registered wallet's current FRG
@@ -836,6 +901,10 @@ export function createApp({ store, payout, config }) {
     let payoutUstcBalance = null;
     try { if (payoutAddress) payoutBalance = (await payout.getBalance()).toString(); } catch { /* show null */ }
     try { if (payoutAddress) payoutUstcBalance = (await payout.getUstcBalance()).toString(); } catch { /* show null */ }
+    // Gas tank: the payout wallet's LUNC, the per-send reserve the
+    // low-gas guard enforces, and how many sends that covers.
+    let gasUluna = null;
+    try { if (payoutAddress && typeof payout.getGasBalance === 'function') gasUluna = await payout.getGasBalance(); } catch { /* show null */ }
     res.json({
       holders: store.walletCount(),
       ...rewardMeta,
@@ -847,6 +916,21 @@ export function createApp({ store, payout, config }) {
       ...minHoldingView(),
       ...splitTimerView(),
       registered: store.allRegistrations().length,
+      // The registered-wallet list itself, so the owner can remove
+      // a wallet by hand (deregister route below).
+      registrations: store.allRegistrations().map((r) => ({
+        wallet: r.wallet, registeredAt: r.registeredAt,
+      })),
+      // The memo every payout send carries (fixed copy, payout.js).
+      payoutMemo: PAYOUT_MEMO,
+      // Gas view: LUNC held for fees, the per-send reserve, and
+      // the number of sends the tank currently covers.
+      gas: {
+        luncBalance: gasUluna === null ? null : gasUluna.toString(),
+        luncBalanceWhole: gasUluna === null ? null : formatBaseToWhole(gasUluna),
+        reservePerSendWhole: formatBaseToWhole(GAS_RESERVE_PER_SEND_ULUNA),
+        sendsCovered: gasUluna === null ? null : Number(gasUluna / GAS_RESERVE_PER_SEND_ULUNA),
+      },
       lastPayoutRun: payoutRunView(store.latestPayoutRun()),
       affiliateRateBps: store.getAffiliateRateBps(),
       affiliateRatePercent: store.getAffiliateRateBps() / 100,
@@ -922,6 +1006,27 @@ export function createApp({ store, payout, config }) {
       store.setMinHoldingBase(base);
       res.json({ ...minHoldingView(), ...rewardMeta });
     } catch (e) { bad(res, 400, e.message || 'invalid minimum holding'); }
+  });
+
+  // DEREGISTER a wallet by hand (owner, 2026-11-07 — he wants his
+  // own wallet out of his own app's split). Removes ONLY the
+  // registration row (the same store call the minimum-holding rule
+  // uses): the wallet takes no part in future splits until it
+  // pastes its address again. Past accruals/payments in the ledger
+  // are NOT touched, and NFT bonus records are NOT touched either
+  // (the NFT exclusion list is a separate mechanism, unchanged).
+  app.post('/api/admin/deregister', requireAdmin, (req, res) => {
+    const wallet = String(req.body?.wallet || '').trim();
+    if (!isValidTerraAddress(wallet)) return bad(res, 400, 'invalid Terra address');
+    const wasRegistered = store.registrationFor(wallet) !== null;
+    if (wasRegistered) store.removeRegistration(wallet);
+    res.json({
+      wallet, removed: wasRegistered,
+      registered: store.allRegistrations().length,
+      registrations: store.allRegistrations().map((r) => ({
+        wallet: r.wallet, registeredAt: r.registeredAt,
+      })),
+    });
   });
 
   // The SPLIT COUNTDOWN TIMER (owner, 2026-11-05). The owner
@@ -1025,18 +1130,42 @@ export function createApp({ store, payout, config }) {
   });
 
   // THE PAYOUT BUTTON. The owner presses; only then do sends go
-  // out. Idempotent per day (see runPayoutDay). Nothing in the app
-  // sends on a timer.
+  // out. Idempotent per day (see runPayoutDay). Auto-pay (below)
+  // shares the same mutex, so a press and the timer can never
+  // run two payouts at once.
   const payoutMutex = createMutex();
   app.post('/api/admin/payout', requireAdmin, async (_req, res) => {
     if (!payout.configured) return bad(res, 503, 'payout wallet not configured yet');
     try {
       const run = await payoutMutex(() => runPayoutDay(store, payout, fetchBalanceLive, { priceFeed: priceFeedLive }));
-      res.json({ ...payoutRunView(run), halted: run.status === 'halted_price' });
+      res.json({
+        ...payoutRunView(run),
+        halted: run.status === 'halted_price' || run.status === 'halted_gas',
+        haltReason: run.detail?.error || null,
+      });
     } catch (e) {
       bad(res, 502, `payout run failed: ${e.message}`);
     }
   });
+
+  // AUTO-PAY scheduler (owner order, 2026-11-07): when the split
+  // timer reaches zero, the payout runs by itself (maybeAutoPayout
+  // — same run builder, same guards, price failure still halts).
+  // Checks every minute; the per-day guard inside maybeAutoPayout
+  // makes repeat checks no-ops. Disable with config.autoPayout
+  // === false (tests drive maybeAutoPayout directly instead).
+  if (config.autoPayout !== false) {
+    const timer = setInterval(() => {
+      if (!payout.configured) return;
+      payoutMutex(() => maybeAutoPayout(store, payout, fetchBalanceLive, { priceFeed: priceFeedLive }))
+        .then((r) => {
+          if (r.ran) console.log(`auto-payout ${r.run.day}: status ${r.run.status}, paid ${r.run.totalPaid} base units`);
+        })
+        .catch((e) => console.error('auto-payout check failed:', e.message));
+    }, config.autoPayoutIntervalMs || 60_000);
+    timer.unref?.();
+    app.locals.autoPayoutTimer = timer;
+  }
 
   app.post('/api/admin/rate', requireAdmin, (req, res) => {
     const pct = Number(req.body?.percent ?? req.body?.rate);

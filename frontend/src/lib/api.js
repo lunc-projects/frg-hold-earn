@@ -83,6 +83,10 @@ export const adminTimerClear = (secret, address) =>
   api('/api/admin/timer/clear', { method: 'POST', headers: adminHeaders(secret, address), body: JSON.stringify({}) });
 export const adminRunPayout = (secret, address) =>
   api('/api/admin/payout', { method: 'POST', headers: adminHeaders(secret, address), body: JSON.stringify({}) });
+// Deregister a wallet by hand (owner action): removes only its
+// registration; NFT bonus records are untouched.
+export const adminDeregister = (secret, address, wallet) =>
+  api('/api/admin/deregister', { method: 'POST', headers: adminHeaders(secret, address), body: JSON.stringify({ wallet }) });
 // Full FRG accounting (read-only): this app's own books — the
 // giveaway ledger, the NFT bonus ledger, holdings/settings, and a
 // live payout-wallet snapshot. Display/export only; nothing here

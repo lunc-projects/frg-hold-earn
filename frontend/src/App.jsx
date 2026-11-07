@@ -3,7 +3,7 @@ import { ADMIN_ADDRESS, FINDER, toWhole, shortAddr } from './config.js';
 import {
   fetchHoldings, getStats, getBalance, getRewards, getReferrals, register,
   getAdmin, adminSetRate, adminSnapshot, adminSetPayoutAmount, adminSetLimit,
-  adminSetMinHolding, adminPayoutPreview, adminRunPayout,
+  adminSetMinHolding, adminPayoutPreview, adminRunPayout, adminDeregister,
   adminTimerStart, adminTimerSet, adminTimerClear,
   getAdminAccounting, downloadAdminAccountingCsv,
   getNft, collectNftBonus, getAdminNft, adminSetNftSettings, adminFundBonusPool,
@@ -242,7 +242,9 @@ export default function App() {
       setLastRun(run);
       pushLog(run.status === 'halted_price'
         ? '⛔ Payout halted: the live price could not be read, so nothing was paid. Press again when the price is back.'
-        : `✅ Payout run ${run.day}: status ${run.status} — paid ${run.totalPaidWhole} ${rewardSymbol} to the registered wallets.`);
+        : run.status === 'halted_gas'
+          ? `⛔ Payout halted: not enough LUNC for gas. ${run.haltReason || 'Top up LUNC and press again.'}`
+          : `✅ Payout run ${run.day}: status ${run.status} — paid ${run.totalPaidWhole} ${rewardSymbol} to the registered wallets.`);
       await loadStats();
       if (address) await refreshViews(address);
     } catch (e) {
@@ -250,6 +252,14 @@ export default function App() {
     } finally {
       setPayoutBusy(false);
     }
+  };
+
+  // Remove a wallet from registration by hand (owner action).
+  // Only the registration goes — NFT bonus records are untouched,
+  // and the wallet can rejoin any time by pasting its address.
+  const deregisterWallet = async (wallet) => {
+    const out = await doAdmin(`Removed ${shortAddr(wallet)} from registration`, () => adminDeregister(adminSecret, address, wallet));
+    if (out) await loadAdmin();
   };
 
   const saveNftSettings = async () => {
@@ -410,6 +420,22 @@ export default function App() {
             <div className="adminstats">
               <p>Holders: {adminStats.holders} · Paid out: {toWhole(adminStats.totalPaid)} {adminStats.rewardSymbol || rewardSymbol} · Accrued: {toWhole(adminStats.totalAccrued)} {adminStats.rewardSymbol || rewardSymbol}</p>
               <p>Registered wallets: {adminStats.registered} · Daily payout amount: ${adminStats.dailyPayoutUsd} total · Daily hard limit: {adminStats.dailyLimitWhole} FRG · Minimum holding: {adminStats.minHoldingWhole} FRG · Affiliate rate: {adminStats.affiliateRatePercent}%</p>
+              {adminStats.payoutMemo && (
+                <p>Payout memo on every send: <span className="mono">“{adminStats.payoutMemo}”</span></p>
+              )}
+              {adminStats.gas && (
+                <p>Gas tank (payout wallet LUNC): {adminStats.gas.luncBalanceWhole ?? '—'} LUNC · reserve {adminStats.gas.reservePerSendWhole} LUNC per send · ≈ {adminStats.gas.sendsCovered ?? '—'} sends covered. A run refuses before sending if the tank can&apos;t cover every send.</p>
+              )}
+              {(adminStats.registrations || []).length > 0 && (
+                <div>
+                  <p className="muted">Registered wallets — Remove takes a wallet out of future splits (it can rejoin by pasting again). NFT bonus records are not touched.</p>
+                  {adminStats.registrations.map((r) => (
+                    <p key={r.wallet} className="mono">{r.wallet}{' '}
+                      <button className="ghost" onClick={() => deregisterWallet(r.wallet)}>Remove</button>
+                    </p>
+                  ))}
+                </div>
+              )}
               <p>Split timer: {adminStats.splitDeadlineMs
                 ? <>⏰ deadline {fmtET(adminStats.splitDeadlineMs)} ({adminStats.secondsRemaining > 0 ? `${fmtCountdown(adminStats.secondsRemaining)} left when this panel loaded` : 'time is up — the cutoff applies at the next build'})</>
                 : 'not set — the page shows no clock and every registered wallet is counted.'}</p>
@@ -461,6 +487,7 @@ export default function App() {
 
           <h2>💸 Daily payout</h2>
           <p className="muted">Review the table first — nothing sends until you press the payout button. The table shows every registered wallet, what it holds, its share, and what it will be paid. Loading the preview also applies the minimum-holding rule: wallets below {preview?.minHoldingWhole ?? '…'} FRG are removed from registration and listed under the table.</p>
+          <p className="muted">⏰ Auto-pay: if the split timer is set, the payout also runs BY ITSELF the moment the timer reaches zero — same table, same guards (live price, minimum holding, gas check). The button still works any time. Every send carries the memo shown in the admin stats above.</p>
           <button className="cyan" disabled={previewBusy} onClick={loadPreview}>{previewBusy ? 'Loading…' : '👁 Load payout preview'}</button>
           {preview && (
             <div className="adminstats">
@@ -498,6 +525,9 @@ export default function App() {
               <p>Run {lastRun.day}: <strong>{lastRun.status}</strong> · paid {lastRun.totalPaidWhole} {rewardSymbol} · split {lastRun.totalSplitWhole} {rewardSymbol}
                 {Number(lastRun.shortfall) > 0 && <> · shortfall {toWhole(lastRun.shortfall)} {rewardSymbol} (stays owed)</>}
                 {' · '}{lastRun.registeredCount} registered</p>
+              {lastRun.detail?.error && (
+                <p className="warn">{lastRun.detail.error}</p>
+              )}
               {lastRun.detail?.deregistered?.length > 0 && (
                 <p className="warn">Removed from registration at this run (below the minimum holding): {lastRun.detail.deregistered.map((d) => shortAddr(d.wallet)).join(', ')}</p>
               )}

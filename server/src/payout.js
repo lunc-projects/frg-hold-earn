@@ -50,6 +50,38 @@ const TERRA_HD_PATHS = [stringToPath("m/44'/330'/0'/0/0")];
 
 export const USTC_DENOM = 'uusd';
 
+// Terra Classic on-chain gas price for uluna (columbus-5
+// minGasPrices). The chain's fee check accepts payment in ANY one
+// denom of its multi-denom list, but the offered fee must cover
+// gas x that denom's price. Uluna's price is 28.325 — NOT the
+// 0.15 this file shipped with (a stale pre-2023 value ~189x too
+// low). On 2026-11-07 the first real payout run's 13 sends were
+// ALL rejected at broadcast with code 13 "insufficient fees; got:
+// 26517uluna, required: ...,5007124uluna,..." (26517 = 0.15 x
+// 176,780 gas; 5,007,124 / 176,780 = 28.325). Nothing ever
+// reached the chain. Every send below prices gas at this rate.
+export const TERRA_GAS_PRICE = '28.325uluna';
+
+// The memo on every daily-payout send (owner, 2026-11-07: holders
+// must be able to see in their wallet what the FRG is). On Terra
+// the memo rides on the tx itself, so it shows in every wallet
+// and explorer next to the transfer.
+export const PAYOUT_MEMO = 'Thank you for holding FRG — here is your Hold & Earn reward';
+
+// LUNC (uluna) balance RESERVE required per payout send before a
+// run may start (owner, 2026-11-07: "make sure we have enough
+// gas"). Measured 2026-11-07 from the failed run's own broadcast
+// data: a CW20 transfer estimates ~176,780 gas; at 28.325
+// uluna/gas the chain-required fee is ~5,007,124 uluna ~ 5.01
+// LUNC (independently confirmed by LCD simulate: gas_used
+// 126,015 x 1.4 = ~176,421). The chain's error showed an EMPTY
+// tax leg — CW20 contract executes carry no burn tax in the fee;
+// the 1.5% tax applies to bank sends of taxed denoms, not to
+// this path. The reserve is the measured fee x ~1.5 headroom,
+// so gas-price or gas-estimate drift cannot silently eat a run:
+// 7.5 LUNC/send.
+export const GAS_RESERVE_PER_SEND_ULUNA = 7_500_000n;
+
 const b64 = (obj) => Buffer.from(JSON.stringify(obj)).toString('base64');
 
 export async function cw20Balance(lcdUrl, token, address) {
@@ -113,21 +145,29 @@ export function createPayout({ lcdUrl, rpcUrl, payoutAddress, mnemonic, rewardAs
     return bankBalance(lcdUrl, addr, USTC_DENOM);
   }
 
+  // The payout wallet's LUNC balance in uluna — the gas tank every
+  // send draws its fee from. Read-only (LCD), needs no key.
+  async function gasBalance() {
+    const addr = await address();
+    if (!addr) throw new Error('payout wallet not configured yet');
+    return bankBalance(lcdUrl, addr, 'uluna');
+  }
+
   // USTC send: `amount` base units of USTC (uusd) via a native bank
   // send. The actual USTC balance is re-read from the SENDING wallet
   // immediately before signing and hard-caps the payment. Throws on
   // every failure mode; the caller voids the pending payment on
   // throw. Retained for the dormant USTC reward option — the base
   // Collect reaches it only when the USTC descriptor is selected.
-  async function sendUstc(recipient, amount) {
+  async function sendUstc(recipient, amount, memo = '') {
     const { wallet, from } = await sendingWallet();
     const balance = await bankBalance(lcdUrl, from, USTC_DENOM);
     if (balance < amount) throw new Error('rewards pool empty, top up');
     const client = await SigningStargateClient.connectWithSigner(
-      rpcUrl, wallet, { gasPrice: GasPrice.fromString('0.15uluna') });
+      rpcUrl, wallet, { gasPrice: GasPrice.fromString(TERRA_GAS_PRICE) });
     try {
       const res = await client.sendTokens(from, recipient,
-        [{ denom: USTC_DENOM, amount: amount.toString() }], 'auto');
+        [{ denom: USTC_DENOM, amount: amount.toString() }], 'auto', memo);
       return res.transactionHash;
     } finally {
       client.disconnect();
@@ -138,15 +178,15 @@ export function createPayout({ lcdUrl, rpcUrl, payoutAddress, mnemonic, rewardAs
   // base rewards while FRG is the live reward asset. The actual FRG
   // balance is re-read from the SENDING wallet immediately before
   // signing and hard-caps the payment.
-  async function sendFrg(recipient, amount) {
+  async function sendFrg(recipient, amount, memo = '') {
     const { wallet, from } = await sendingWallet();
     const balance = await cw20Balance(lcdUrl, FRG_TOKEN, from);
     if (balance < amount) throw new Error('rewards pool empty, top up');
     const client = await SigningCosmWasmClient.connectWithSigner(
-      rpcUrl, wallet, { gasPrice: GasPrice.fromString('0.15uluna') });
+      rpcUrl, wallet, { gasPrice: GasPrice.fromString(TERRA_GAS_PRICE) });
     try {
       const res = await client.execute(from, FRG_TOKEN,
-        { transfer: { recipient, amount: amount.toString() } }, 'auto');
+        { transfer: { recipient, amount: amount.toString() } }, 'auto', memo);
       return res.transactionHash;
     } finally {
       client.disconnect();
@@ -164,8 +204,8 @@ export function createPayout({ lcdUrl, rpcUrl, payoutAddress, mnemonic, rewardAs
       ? cw20Balance(lcdUrl, asset.token, addr)
       : bankBalance(lcdUrl, addr, asset.denom);
   }
-  async function sendReward(recipient, amount) {
-    return asset.kind === 'cw20' ? sendFrg(recipient, amount) : sendUstc(recipient, amount);
+  async function sendReward(recipient, amount, memo = '') {
+    return asset.kind === 'cw20' ? sendFrg(recipient, amount, memo) : sendUstc(recipient, amount, memo);
   }
 
   return {
@@ -189,6 +229,9 @@ export function createPayout({ lcdUrl, rpcUrl, payoutAddress, mnemonic, rewardAs
     // funding view; base Collect caps against it only when the
     // USTC descriptor is selected).
     getUstcBalance: ustcBalance,
+
+    // LUNC gas-tank balance (uluna) of the payout wallet.
+    getGasBalance: gasBalance,
 
     // Base reward routing (descriptor-dispatched — see above).
     getRewardBalance: rewardBalance,
