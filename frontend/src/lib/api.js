@@ -83,6 +83,24 @@ export const adminTimerClear = (secret, address) =>
   api('/api/admin/timer/clear', { method: 'POST', headers: adminHeaders(secret, address), body: JSON.stringify({}) });
 export const adminRunPayout = (secret, address) =>
   api('/api/admin/payout', { method: 'POST', headers: adminHeaders(secret, address), body: JSON.stringify({}) });
+// Full FRG accounting (read-only): this app's own books — the
+// giveaway ledger, the NFT bonus ledger, holdings/settings, and a
+// live payout-wallet snapshot. Display/export only; nothing here
+// can move money.
+export const getAdminAccounting = (secret, address) =>
+  api('/api/admin/accounting', { headers: adminHeaders(secret, address) });
+// The CSV statement: same numbers as the accounting view, fetched
+// as a blob so the admin headers can ride along, then saved by the
+// caller as a download.
+export const downloadAdminAccountingCsv = async (secret, address) => {
+  const url = API_BASE ? `${API_BASE}/api/admin/accounting.csv` : '/api/admin/accounting.csv';
+  const res = await fetchWithTimeout(url, { headers: adminHeaders(secret, address) });
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    throw new Error(data.error || `Request failed (${res.status})`);
+  }
+  return res.blob();
+};
 
 // --- NFT bonus section (separate ledger; viewing is paste-only,
 // bonus Collect is a server-side payout — no signing anywhere) ---

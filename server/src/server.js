@@ -41,7 +41,8 @@ import {
 } from './engine.js';
 import { fetchFrgUsdPrice, amountBaseForUsd, frgUsdPrice } from './price.js';
 import { rewardAssetFor } from './assets.js';
-import { createPayout, cw20Balance, FRG_TOKEN } from './payout.js';
+import { createPayout, cw20Balance, bankBalance, FRG_TOKEN } from './payout.js';
+import { buildAccounting, accountingToCsv } from './accounting.js';
 import {
   consolidateNftPower, computeNftDailyBonusByType,
   normalizeTypeCounts, emptyTypeCounts,
@@ -1115,6 +1116,54 @@ export function createApp({ store, payout, config }) {
     } catch (e) {
       bad(res, 400, e.message);
     }
+  });
+
+  // --- Admin ACCOUNTING (read-only; owner, 2026-11-07) ---
+  // Full FRG accounting for THIS app, inside this app's own admin
+  // panel: the giveaway ledger (every payout run + running total),
+  // the NFT bonus ledger, holdings/registrations, and a CSV
+  // export. These books are this app's alone — fully separate
+  // from LUNC Dev Studio accounting (no shared ledger, no
+  // cross-references); only the clean presentation style matches.
+  // DISPLAY AND EXPORT ONLY: no route here moves money, and the
+  // payout press above is untouched. Figures come from the app's
+  // records plus, for the wallet snapshot block, a live LCD read
+  // at request time — a failed read shows null (the panel renders
+  // "balance unavailable — check link"), never a stale number.
+  const accountingWalletSnapshot = async () => {
+    const payoutAddress = await payout.address();
+    let frg = null;
+    let lunc = null;
+    if (payoutAddress) {
+      try { frg = await payout.getBalance(); } catch { frg = null; }
+      try { lunc = await bankBalance(config.lcdUrl, payoutAddress, 'uluna'); } catch { lunc = null; }
+    }
+    return {
+      address: payoutAddress,
+      readAt: new Date().toISOString(),
+      frg: frg === null ? null : frg.toString(),
+      frgWhole: frg === null ? null : formatBaseToWhole(frg),
+      lunc: lunc === null ? null : lunc.toString(),
+      luncWhole: lunc === null ? null : formatBaseToWhole(lunc),
+    };
+  };
+
+  app.get('/api/admin/accounting', requireAdmin, async (_req, res) => {
+    const acct = buildAccounting(store);
+    // BigInt-safe serialization: base-unit BigInts ship as strings,
+    // alongside the pre-formatted whole-token strings.
+    const body = JSON.parse(JSON.stringify(acct, (_k, v) => (typeof v === 'bigint' ? v.toString() : v)));
+    body.payoutWallet = await accountingWalletSnapshot();
+    res.json(body);
+  });
+
+  app.get('/api/admin/accounting.csv', requireAdmin, async (_req, res) => {
+    const acct = buildAccounting(store);
+    const payoutAddress = await payout.address();
+    const csv = accountingToCsv(acct, { payoutWallet: payoutAddress, generatedAt: Date.now() });
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="frg-hold-earn-accounting-${dayString()}.csv"`);
+    res.send(csv);
   });
 
   // Serve the built frontend when it exists (single-service deploy).

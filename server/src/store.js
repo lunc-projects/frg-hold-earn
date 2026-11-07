@@ -732,6 +732,32 @@ export function openStore(path) {
       return all(`SELECT * FROM payments WHERE wallet = ? ORDER BY id DESC LIMIT 20`, wallet);
     },
 
+    // --- Accounting reads (owner's admin accounting view, 2026-11-07) ---
+    // Read-only whole-ledger queries for THIS app's own books. FRG
+    // Hold & Earn accounting lives entirely inside this app — it is
+    // fully separate from any other product's accounting (no shared
+    // ledger, no cross-references); only the presentation style is
+    // shared. Nothing here writes.
+    // Every payout run ever recorded, oldest first.
+    allPayoutRuns() {
+      return all(`SELECT * FROM payout_runs ORDER BY day ASC`)
+        .map((r) => this._payoutRunRow(r));
+    },
+    // Every base payment row ever recorded (pending + confirmed +
+    // void), oldest first. Amounts are BigInt base units.
+    allPayments() {
+      return all(`SELECT * FROM payments ORDER BY id ASC`).map((r) => ({
+        id: r.id, wallet: r.wallet, amount: BigInt(r.amount),
+        status: r.status, txhash: r.txhash, createdAt: r.created_at,
+      }));
+    },
+    // The most recent day with recorded payout snapshot balances
+    // (the holdings the latest recorded split used), or null.
+    latestSnapshotDay() {
+      const r = q(`SELECT MAX(day) AS d FROM snapshots`);
+      return r && r.d ? r.d : null;
+    },
+
     // --- Referrals ---
     referralsOf(referrer) {
       return all(`SELECT address FROM wallets WHERE referrer = ? ORDER BY address`, referrer)
@@ -964,6 +990,33 @@ export function openStore(path) {
     },
     nftPaymentsFor(wallet) {
       return all(`SELECT * FROM nft_payments WHERE wallet = ? ORDER BY id DESC LIMIT 20`, wallet);
+    },
+    // --- NFT accounting reads (same read-only accounting view) ---
+    // Every NFT bonus accrual row, day by day, oldest first.
+    allNftAccruals() {
+      return all(`SELECT day, wallet, amount FROM nft_accruals ORDER BY day ASC, wallet ASC`)
+        .map((r) => ({ day: r.day, wallet: r.wallet, amount: BigInt(r.amount) }));
+    },
+    // Every NFT bonus payment row ever recorded, oldest first.
+    allNftPayments() {
+      return all(`SELECT * FROM nft_payments ORDER BY id ASC`).map((r) => ({
+        id: r.id, wallet: r.wallet, amount: BigInt(r.amount),
+        status: r.status, txhash: r.txhash, createdAt: r.created_at,
+      }));
+    },
+    // Every recorded bonus-pool funding event, oldest first.
+    allNftPoolEvents() {
+      return all(`SELECT * FROM nft_pool_events ORDER BY id ASC`).map((r) => ({
+        id: r.id, amount: BigInt(r.amount), note: r.note,
+        txhash: r.txhash, createdAt: r.created_at,
+      }));
+    },
+    // Every wallet that has an NFT snapshot row (any day) — the
+    // per-wallet accounting table covers these even when a wallet
+    // accrued 0 (e.g. its count ran while it was excluded).
+    allNftSnapshotWallets() {
+      return all(`SELECT DISTINCT wallet FROM nft_snapshots ORDER BY wallet`)
+        .map((r) => r.wallet);
     },
   };
 }

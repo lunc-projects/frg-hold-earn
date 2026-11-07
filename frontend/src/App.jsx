@@ -5,6 +5,7 @@ import {
   getAdmin, adminSetRate, adminSnapshot, adminSetPayoutAmount, adminSetLimit,
   adminSetMinHolding, adminPayoutPreview, adminRunPayout,
   adminTimerStart, adminTimerSet, adminTimerClear,
+  getAdminAccounting, downloadAdminAccountingCsv,
   getNft, collectNftBonus, getAdminNft, adminSetNftSettings, adminFundBonusPool,
 } from './lib/api.js';
 
@@ -19,6 +20,15 @@ const fmtET = (ms) => new Date(ms).toLocaleString('en-US', {
   month: 'numeric', day: 'numeric', year: 'numeric',
   hour: 'numeric', minute: '2-digit', second: '2-digit', hour12: true,
 }) + ' ET';
+
+// Accounting links: FULL addresses and tx hashes, always clickable
+// finder links, never truncated (owner's standing rule).
+const FinderAddr = ({ addr }) => (
+  <a href={`${FINDER}/address/${addr}`} target="_blank" rel="noreferrer">{addr}</a>
+);
+const FinderTx = ({ hash }) => (hash
+  ? <a href={`${FINDER}/tx/${hash}`} target="_blank" rel="noreferrer">{hash}</a>
+  : <>—</>);
 
 const fmtCountdown = (totalSeconds) => {
   const s = Math.max(0, Math.floor(totalSeconds));
@@ -58,6 +68,11 @@ export default function App() {
   const [rateInput, setRateInput] = useState('');
   const [preview, setPreview] = useState(null);
   const [previewBusy, setPreviewBusy] = useState(false);
+  // Full FRG accounting (this app's own books only — fully separate
+  // from LUNC Dev Studio accounting; same clean style, no shared
+  // numbers). Read-only: loading it never changes anything.
+  const [accounting, setAccounting] = useState(null);
+  const [accountingBusy, setAccountingBusy] = useState(false);
   const [deadlineInput, setDeadlineInput] = useState('');
   // Split countdown: anchored to the SERVER's secondsRemaining on
   // every stats load (the visitor's device clock never decides
@@ -175,6 +190,36 @@ export default function App() {
   const loadAdminNft = async () => {
     const out = await doAdmin('NFT admin stats loaded', () => getAdminNft(adminSecret, address));
     if (out) setAdminNft(out);
+  };
+
+  const loadAccounting = async () => {
+    setAccountingBusy(true);
+    try {
+      const out = await getAdminAccounting(adminSecret, address);
+      setAccounting(out);
+      pushLog('📒 FRG accounting loaded.');
+    } catch (e) {
+      pushLog(`Accounting failed: ${e.message}`);
+    } finally {
+      setAccountingBusy(false);
+    }
+  };
+
+  const downloadAccounting = async () => {
+    try {
+      const blob = await downloadAdminAccountingCsv(adminSecret, address);
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'frg-hold-earn-accounting.csv';
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+      pushLog('📒 Accounting CSV downloaded — the same numbers as the accounting view.');
+    } catch (e) {
+      pushLog(`Accounting CSV failed: ${e.message}`);
+    }
   };
 
   const loadPreview = async () => {
@@ -506,6 +551,144 @@ export default function App() {
           <input type="number" min="0" step="any" value={nftFundInput} onChange={(e) => setNftFundInput(e.target.value)} />
           <input type="text" placeholder="Note (e.g. mint tx hash)" value={nftFundNoteInput} onChange={(e) => setNftFundNoteInput(e.target.value)} />
           <button className="cyan" onClick={() => nftFundInput && doAdmin('Funding recorded', () => adminFundBonusPool(adminSecret, address, nftFundInput, nftFundNoteInput))}>Record funding</button>
+
+          <h2>📒 FRG accounting</h2>
+          <p className="muted">This app&apos;s own books — the full FRG accounting for Hold &amp; Earn only, kept completely separate from LUNC Dev Studio accounting. Every number comes from this app&apos;s records; the wallet balances are read live from the chain when the page loads. Read-only: this section displays and exports, it never moves money.</p>
+          <button className="cyan" disabled={accountingBusy} onClick={loadAccounting}>{accountingBusy ? 'Loading…' : '📒 Load FRG accounting'}</button>
+          {accounting && (
+            <button className="ghost" onClick={downloadAccounting}>⬇ Download accounting CSV</button>
+          )}
+          {accounting && (
+            <div className="adminstats">
+              <p className="muted">{accounting.recordsFrom
+                ? <>Records from {accounting.recordsFrom} — this app&apos;s first recorded day.</>
+                : <>No records yet — the books start with the first payout run.</>}</p>
+
+              <h3>💼 Payout wallet — live from the chain</h3>
+              {accounting.payoutWallet?.address ? (
+                <>
+                  <p className="mono"><FinderAddr addr={accounting.payoutWallet.address} /></p>
+                  <p>FRG balance: {accounting.payoutWallet.frgWhole !== null
+                      ? <span className="big">{Number(accounting.payoutWallet.frgWhole).toLocaleString()}</span>
+                      : <span className="warn">balance unavailable — check the link above</span>}
+                    {' · '}LUNC balance (for fees): {accounting.payoutWallet.luncWhole !== null
+                      ? Number(accounting.payoutWallet.luncWhole).toLocaleString()
+                      : <span className="warn">balance unavailable — check the link above</span>}</p>
+                  <p className="muted">Read from the chain at {fmtET(Date.parse(accounting.payoutWallet.readAt))} — the number as-read, never a stored copy.</p>
+                </>
+              ) : <p className="warn">Payout wallet address not set.</p>}
+
+              <h3>🎁 The giveaway — what we give away</h3>
+              <p><span className="big gold">{Number(accounting.giveaway.totalPaidWhole).toLocaleString()} FRG</span> given away all-time
+                {accounting.giveaway.totalPaidUsdAtRunPrices !== null
+                  ? <> ≈ ${accounting.giveaway.totalPaidUsdAtRunPrices.toFixed(2)} at each run&apos;s own price</>
+                  : <> (USD total not fully known — a paid run has no stored price)</>}
+                {' · '}{accounting.giveaway.runCount} payout run(s) · split {Number(accounting.giveaway.totalSplitWhole).toLocaleString()} FRG
+                {Number(accounting.giveaway.totalShortfall) > 0 && <> · shortfall still owed {toWhole(accounting.giveaway.totalShortfall)} FRG</>}</p>
+              <p className="muted">Payments ledger cross-check: accrued {toWhole(accounting.giveaway.ledgerAccrued)} FRG · paid (pending + confirmed) {toWhole(accounting.giveaway.ledgerPaid)} FRG.</p>
+              {accounting.giveaway.runs.map((r) => (
+                <div key={r.day}>
+                  <p><strong>Run {r.day}</strong> · {r.status} · pressed {r.pressedAt ? fmtET(r.pressedAt) : '—'}
+                    {' · '}{r.registeredCount} wallet(s) · amount set ${r.payoutUsd}
+                    {r.priceFrgUsd !== null && <> at ${r.priceFrgUsd} per FRG (that run&apos;s live price)</>}
+                    {' · '}pot {r.potWhole !== null ? Number(r.potWhole).toLocaleString() : '—'} FRG
+                    {' · '}paid <strong>{Number(r.totalPaidWhole).toLocaleString()} FRG</strong>
+                    {r.paidUsdAtRunPrice !== null && <> (${r.paidUsdAtRunPrice.toFixed(2)})</>}
+                    {r.error && <span className="warn"> · {r.error}</span>}</p>
+                  {r.rows.length > 0 && (
+                    <table className="payout">
+                      <thead><tr><th>Wallet</th><th>Held</th><th>Share</th><th>Sent</th><th>Status</th><th>Tx</th></tr></thead>
+                      <tbody>
+                        {r.rows.map((row) => (
+                          <tr key={row.wallet}>
+                            <td className="addr"><FinderAddr addr={row.wallet} /></td>
+                            <td>{row.balanceWhole}</td>
+                            <td>{row.amountWhole}</td>
+                            <td>{row.sentWhole}</td>
+                            <td>{row.payStatus || '—'}</td>
+                            <td className="addr"><FinderTx hash={row.txhash} /></td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  )}
+                  {r.deregistered.length > 0 && (
+                    <p className="warn">Removed from registration at this run (below the minimum holding): {r.deregistered.map((d) => d.wallet).join(', ')}</p>
+                  )}
+                </div>
+              ))}
+              {accounting.giveaway.perWallet.length > 0 && (
+                <>
+                  <p><strong>Giveaway totals per wallet (all runs)</strong></p>
+                  <table className="payout">
+                    <thead><tr><th>Wallet</th><th>Total share</th><th>Total sent</th></tr></thead>
+                    <tbody>
+                      {accounting.giveaway.perWallet.map((w) => (
+                        <tr key={w.wallet}>
+                          <td className="addr"><FinderAddr addr={w.wallet} /></td>
+                          <td>{w.shareWhole}</td>
+                          <td>{w.sentWhole}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </>
+              )}
+
+              <h3>🔋 NFT bonus ledger</h3>
+              <p>Bonus pool wallet: {accounting.nftBonus.bonusPoolWallet
+                ? <span className="mono"><FinderAddr addr={accounting.nftBonus.bonusPoolWallet} /></span>
+                : 'not set'}
+                {' · '}funded <strong>{Number(accounting.nftBonus.fundedWhole).toLocaleString()} FRG</strong>
+                {' · '}paid out {Number(accounting.nftBonus.paidWhole).toLocaleString()} FRG
+                {' · '}available (funded − paid) <span className="gold">{Number(accounting.nftBonus.availableWhole).toLocaleString()} FRG</span>
+                {' · '}accrued to holders {Number(accounting.nftBonus.accruedTotalWhole).toLocaleString()} FRG</p>
+              {accounting.nftBonus.poolEvents.map((e) => (
+                <p key={e.id} className="mono">Funding #{e.id}: +{e.amountWhole} FRG{e.note ? ` — ${e.note}` : ''} · <FinderTx hash={e.txhash} /></p>
+              ))}
+              {accounting.nftBonus.accrualDays.length > 0 && (
+                <table className="payout">
+                  <thead><tr><th>Day</th><th>Wallets accrued</th><th>Bonus accrued</th></tr></thead>
+                  <tbody>
+                    {accounting.nftBonus.accrualDays.map((d) => (
+                      <tr key={d.day}><td>{d.day}</td><td>{d.wallets}</td><td>{d.totalWhole}</td></tr>
+                    ))}
+                  </tbody>
+                </table>
+              )}
+              {accounting.nftBonus.perWallet.length > 0 && (
+                <table className="payout">
+                  <thead><tr><th>Wallet</th><th>NFTs</th><th>Types (B/C/U)</th><th>Last count</th><th>Accrued</th><th>Collected</th><th>Claimable</th></tr></thead>
+                  <tbody>
+                    {accounting.nftBonus.perWallet.map((w) => (
+                      <tr key={w.wallet}>
+                        <td className="addr"><FinderAddr addr={w.wallet} /></td>
+                        <td>{w.nftCount}</td>
+                        <td>{w.typeCounts.bonus}/{w.typeCounts.common}/{w.typeCounts.uncommon}</td>
+                        <td>{w.lastSnapshotDay || '—'}</td>
+                        <td>{w.accruedWhole}</td>
+                        <td>{w.paidWhole}</td>
+                        <td>{w.claimableWhole}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              )}
+              {accounting.nftBonus.payments.filter((p) => p.status === 'confirmed').map((p) => (
+                <p key={p.id} className="mono">Bonus payment #{p.id}: {p.amountWhole} FRG → {p.wallet} · <FinderTx hash={p.txhash} /></p>
+              ))}
+
+              <h3>📊 Holdings &amp; settings (current)</h3>
+              <p>Registered wallets: <strong>{accounting.holdings.registeredCount}</strong>
+                {accounting.holdings.latestSnapshotDay
+                  ? <> · latest recorded snapshot {accounting.holdings.latestSnapshotDay}: {accounting.holdings.latestSnapshotWallets} wallet(s) holding <strong>{Number(accounting.holdings.totalHeldLatestWhole).toLocaleString()} FRG</strong> in total</>
+                  : <> · no payout snapshot recorded yet</>}
+                {' · '}minimum holding {accounting.holdings.minHoldingWhole} FRG
+                {' · '}daily payout amount ${accounting.holdings.dailyPayoutUsd}
+                {' · '}daily hard limit {accounting.holdings.dailyLimitWhole} FRG
+                {accounting.holdings.splitDeadlineMs && <> · split deadline {fmtET(accounting.holdings.splitDeadlineMs)}</>}</p>
+            </div>
+          )}
         </div>
       )}
 
