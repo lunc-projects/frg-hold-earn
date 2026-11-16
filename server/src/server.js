@@ -208,6 +208,28 @@ export async function buildPayoutTable(store, fetchBalance, { now = new Date(), 
   };
 }
 
+// SPLIT-TIMER SELF-RESTART (fix, 2026-11-15): the split deadline
+// is a PER-ROUND cutoff — after a round pays, the deadline must
+// roll forward or every later build keeps using the same frozen
+// cutoff and wallets registered after it are excluded forever
+// (the Nov 7–15 incident: the deadline sat at 2026-11-07T13:00Z
+// for eight days, so the same 8 wallets split every pot while 8
+// later registrations — reported as lateRegistrations each run —
+// were never paid). advanceSplitDeadline moves a stored deadline
+// that has been reached forward in exact +24h steps (preserving
+// its wall-clock time, 08:00 ET for the owner's timer) until it is
+// in the future. No timer set: returns null and changes nothing.
+// A deadline still in the future is returned unchanged.
+export function advanceSplitDeadline(store, nowMs) {
+  const current = store.getSplitDeadlineMs();
+  if (!current || current <= 0) return null;
+  if (current > nowMs) return current;
+  let next = current;
+  while (next <= nowMs) next += 24 * 3600 * 1000;
+  store.setSplitDeadlineMs(next);
+  return next;
+}
+
 // THE owner-pressed payout run. One run per day:
 // 1. If the day is not recorded yet, the table is built (above)
 //    and the day's accruals are recorded ONCE from the split
@@ -401,6 +423,16 @@ export async function runPayoutDay(store, payout, fetchBalance, { now = new Date
       error: gasHalt,
     },
   };
+  // Timer self-restart: a run that EXECUTED (completed, partial,
+  // pool-scaled — anything but a halt) satisfies its round, so a
+  // reached deadline rolls to the next round (+24h steps) and the
+  // wallets this build reported as lateRegistrations join the next
+  // split. A HALTED run (halted_gas here; halted_price returns
+  // earlier) must NOT advance: the day stays due and later checks
+  // retry it. The new deadline rides on the run record.
+  if (status !== 'halted_gas') {
+    rec.nextDeadlineMs = advanceSplitDeadline(store, now.getTime());
+  }
   store.savePayoutRun(rec);
   return rec;
 }
@@ -411,8 +443,10 @@ export async function runPayoutDay(store, payout, fetchBalance, { now = new Date
 // before. Semantics:
 // - No timer set, or deadline still in the future: nothing to do.
 // - A run for today that was pressed/executed AT OR AFTER the
-//   deadline already satisfies the day (a press before the
-//   deadline does not: at zero, whatever is still owed goes out).
+//   deadline it recorded already satisfies the day (a press before
+//   the deadline does not: at zero, whatever is still owed goes
+//   out). A satisfied day rolls the deadline to the next round
+//   (advanceSplitDeadline) instead of firing again.
 // - A price failure inside the run still halts it and pays
 //   nothing (runPayoutDay's halted_price) — auto-pay never
 //   guesses a price. A halted day is retried by later checks the
@@ -425,13 +459,41 @@ export async function runPayoutDay(store, payout, fetchBalance, { now = new Date
 export async function maybeAutoPayout(store, payout, fetchBalance, { now = new Date(), priceFeed } = {}) {
   const deadlineMs = store.getSplitDeadlineMs();
   if (!deadlineMs || deadlineMs <= 0) return { ran: false, reason: 'no-timer' };
-  if (now.getTime() < deadlineMs) return { ran: false, reason: 'not-due' };
   const day = dayString(now);
   const existing = store.getPayoutRun(day);
-  if (existing && existing.status !== 'halted_price' && existing.status !== 'halted_gas'
-      && existing.pressedAt >= deadlineMs) {
+  // A run satisfies its round when it was pressed at/after the
+  // deadline IT recorded (detail.splitDeadlineMs): the stored
+  // deadline rolls forward after a satisfied round, and comparing
+  // against the rolled-forward value would make a paid day look
+  // unsatisfied. A satisfied day whose stored deadline is stale
+  // ADVANCES the deadline instead of firing again (self-restart).
+  const satisfiedBy = (run) => {
+    if (!run || run.status === 'halted_price' || run.status === 'halted_gas') return false;
+    const used = run.detail?.splitDeadlineMs ?? deadlineMs;
+    return run.pressedAt >= used;
+  };
+  if (satisfiedBy(existing)) {
+    advanceSplitDeadline(store, now.getTime());
     return { ran: false, reason: 'already-ran' };
   }
+  // DAY-FLIP GUARD: the UTC day flips at 19:00 ET, hours before
+  // the 08:00 ET deadline. If the stored deadline was left stale
+  // (e.g. reset by an old admin action) and YESTERDAY's completed
+  // run was already pressed at/after it, that deadline's round is
+  // satisfied — advance it instead of firing a spurious early run
+  // for the new day. In the healthy cycle this never triggers:
+  // yesterday's press always precedes today's deadline.
+  const prev = store.getPayoutRun(dayString(new Date(now.getTime() - 24 * 3600 * 1000)));
+  if (prev && prev.status !== 'halted_price' && prev.status !== 'halted_gas'
+      && prev.pressedAt >= deadlineMs) {
+    advanceSplitDeadline(store, now.getTime());
+    return { ran: false, reason: 'already-ran' };
+  }
+  // The satisfied checks come BEFORE the not-due check: after a
+  // satisfied round the stored deadline has rolled past `now`, and
+  // a paid day must still report 'already-ran', never look merely
+  // "not due" (which would misstate why nothing fired).
+  if (now.getTime() < deadlineMs) return { ran: false, reason: 'not-due' };
   const run = await runPayoutDay(store, payout, fetchBalance, { now, priceFeed });
   return { ran: true, run };
 }
