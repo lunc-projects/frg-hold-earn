@@ -49,6 +49,34 @@ export const CATCHUP_CREDIT_2026_11_15 = [
   ['terra192ug0uwdzyxq9nnqa0xugesztx5ecqwkqzj72m', '483210000'],  //   483.21 FRG
 ]; // total 6,409,490,000 base units = 6,409.49 FRG
 
+// ── One-time catch-up credit, day 2 (owner ruling, 2026-11-16) ──
+// The cutoff fix deployed Nov 15 at 19:06 ET, but the daily run
+// for day 2026-11-16 fired at 19:00 ET (00:00 UTC) — 6 minutes
+// BEFORE the fix — so it ran the old frozen-cutoff code one last
+// time and paid the same 8 wallets (pot 1,373.98362 FRG). The
+// same 6 wallets were missed again for that one day. The amounts
+// below are their estimated pro-rata shares of the Nov 16 pot
+// actually split (he-catchup-nov16-table-2026-11-16.txt — the
+// paid 8 weighted by their run-record balances, the missed 6 by
+// live balances read 2026-11-16, the payout wallet's estimated
+// run-time balance in the weight only, exactly as in round 1).
+// Same mechanism, new rows: day '2026-11-16', kind
+// 'catchup-2026-11-16', its own applied flag — the Nov 15 rows
+// and flag above are untouched. Excluded by design, as before:
+// the 8 wallets the Nov 16 run paid, the payout wallet's own
+// circular share, and kur3 (held 0 FRG — share is 0).
+// Amounts are FRG base units (6 decimals), as everywhere here.
+export const CATCHUP2_CREDIT_DAY = '2026-11-16';
+export const CATCHUP2_CREDIT_KIND = 'catchup-2026-11-16';
+export const CATCHUP_CREDIT_2026_11_16 = [
+  ['terra1a9see2df2w8wh8hsty0y6gw9tkamlkzah8kd74', '192719711'], // 192.719711 FRG
+  ['terra1mmkq4pv75yc867ug4ax04jwkw36g3eky2t7uey', '179964023'], // 179.964023 FRG
+  ['terra10juwukwg2fsvvw8zxx4v09lzvf0zx4wkf3czuq', '162448441'], // 162.448441 FRG
+  ['terra1n5qj93jw56wsym0yp2kpll2ydlpa5c8a0dvej6', '145424534'], // 145.424534 FRG
+  ['terra1zdnanxgsyy8zqpmy3dfgges4xlzdskqsrx6nm3', '122209240'], // 122.209240 FRG
+  ['terra192ug0uwdzyxq9nnqa0xugesztx5ecqwkqzj72m', '65454602'],  //  65.454602 FRG
+]; // total 868,220,551 base units = 868.220551 FRG
+
 export function openStore(path) {
   const db = new DatabaseSync(path);
   db.exec(`
@@ -424,11 +452,44 @@ export function openStore(path) {
     return { applied: true };
   }
 
+  // ── One-time catch-up credit application, day 2 ────────────
+  // Identical guards to round 1, independent state: its own
+  // applied flag ('catchup_2026_11_16_applied_at'), its own
+  // incident gate (the books must contain the recorded payout
+  // run for day 2026-11-16 — the run that fired 6 minutes before
+  // the cutoff fix deployed), and INSERT OR IGNORE over
+  // UNIQUE(day, wallet, kind) with the distinct kind
+  // 'catchup-2026-11-16', so it can never double-credit and can
+  // never disturb the Nov 15 rows. Runs right after round 1.
+  function applyCatchupCredit20261116() {
+    const flag = q(`SELECT value FROM settings WHERE key = 'catchup_2026_11_16_applied_at'`);
+    if (flag) return { applied: false, reason: 'already-applied' };
+    const incidentRun = q(
+      `SELECT day FROM payout_runs WHERE day = '2026-11-16' LIMIT 1`);
+    if (!incidentRun) return { applied: false, reason: 'no-incident-run' };
+    try {
+      db.exec('BEGIN');
+      for (const [wallet, amount] of CATCHUP_CREDIT_2026_11_16) {
+        run(`INSERT OR IGNORE INTO accruals(day, wallet, kind, amount) VALUES(?, ?, ?, ?)`,
+            CATCHUP2_CREDIT_DAY, wallet, CATCHUP2_CREDIT_KIND, amount);
+      }
+      run(`INSERT INTO settings(key, value) VALUES('catchup_2026_11_16_applied_at', ?)
+           ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+          String(Date.now()));
+      db.exec('COMMIT');
+    } catch (e) {
+      try { db.exec('ROLLBACK'); } catch { /* already rolled back */ }
+      throw e;
+    }
+    return { applied: true };
+  }
+
   runLegacyFrgRewardMigration();
   db.prepare(`INSERT OR IGNORE INTO settings(key, value)
               VALUES('reward_denom', 'uusd'), ('reward_symbol', 'USTC')`).run();
   runUstcToFrgRewardMigration();
   applyCatchupCredit20261115();
+  applyCatchupCredit20261116();
 
   return {
     db,
@@ -691,6 +752,20 @@ export function openStore(path) {
       const rows = all(
         `SELECT wallet, amount FROM accruals WHERE kind = ? ORDER BY wallet`,
         CATCHUP_CREDIT_KIND)
+        .map((r) => ({ wallet: r.wallet, amount: BigInt(r.amount) }));
+      return { appliedAt: flag ? Number(flag.value) : null, rows };
+    },
+    // The one-time 2026-11-16 catch-up credit (see
+    // applyCatchupCredit20261116): when it was applied (epoch ms,
+    // or null) and the credit rows as recorded in the accrual
+    // ledger. Read-only audit view — the rows are ordinary
+    // accruals of kind 'catchup-2026-11-16' and flow through
+    // claimable()/Collect like any other accrual.
+    catchupCredit20261116() {
+      const flag = q(`SELECT value FROM settings WHERE key = 'catchup_2026_11_16_applied_at'`);
+      const rows = all(
+        `SELECT wallet, amount FROM accruals WHERE kind = ? ORDER BY wallet`,
+        CATCHUP2_CREDIT_KIND)
         .map((r) => ({ wallet: r.wallet, amount: BigInt(r.amount) }));
       return { appliedAt: flag ? Number(flag.value) : null, rows };
     },
