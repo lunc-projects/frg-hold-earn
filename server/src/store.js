@@ -21,6 +21,34 @@ import { DatabaseSync } from 'node:sqlite';
 import { isValidTerraAddress, isValidTerraContractAddress } from './engine.js';
 import { FRG_TOKEN } from './assets.js';
 
+// ── One-time catch-up credit (owner ruling, 2026-11-15) ──────
+// The frozen-split-cutoff incident (see cutoff-self-restart
+// tests): the split deadline froze at 2026-11-07T13:00:41Z, so
+// the daily builds for Nov 8–15 counted only the 8 wallets
+// registered before it. The 6 wallets below were registered,
+// held FRG, and were excluded from all 8 runs; the amounts are
+// their estimated pro-rata shares of the pots actually paid in
+// that window (he-catchup-table-2026-11-15.txt — estimates from
+// live balances, the right size, not exact to the micro). The
+// owner's ruling: "Just auto credit — then when they come to
+// claim they get extra." So each amount lands in the base
+// accrual ledger as a distinct 'catchup-2026-11-15' row and
+// pays out through the holders' normal Collect, on top of
+// whatever they normally accrued — no sends, no admin action.
+// Excluded by design: the payout wallet's own circular share
+// and kur3 (held 0 FRG — nothing was owed at its balance).
+// Amounts are FRG base units (6 decimals), as everywhere here.
+export const CATCHUP_CREDIT_DAY = '2026-11-15';
+export const CATCHUP_CREDIT_KIND = 'catchup-2026-11-15';
+export const CATCHUP_CREDIT_2026_11_15 = [
+  ['terra1a9see2df2w8wh8hsty0y6gw9tkamlkzah8kd74', '1422720000'], // 1,422.72 FRG
+  ['terra1mmkq4pv75yc867ug4ax04jwkw36g3eky2t7uey', '1328550000'], // 1,328.55 FRG
+  ['terra10juwukwg2fsvvw8zxx4v09lzvf0zx4wkf3czuq', '1199250000'], // 1,199.25 FRG
+  ['terra1n5qj93jw56wsym0yp2kpll2ydlpa5c8a0dvej6', '1073570000'], // 1,073.57 FRG
+  ['terra1zdnanxgsyy8zqpmy3dfgges4xlzdskqsrx6nm3', '902190000'],  //   902.19 FRG
+  ['terra192ug0uwdzyxq9nnqa0xugesztx5ecqwkqzj72m', '483210000'],  //   483.21 FRG
+]; // total 6,409,490,000 base units = 6,409.49 FRG
+
 export function openStore(path) {
   const db = new DatabaseSync(path);
   db.exec(`
@@ -349,10 +377,58 @@ export function openStore(path) {
     }
   }
 
+  // ── One-time catch-up credit application ───────────────────
+  // Runs on openStore, AFTER both currency migrations (the
+  // ledger must already be FRG-denominated — migration #2 wipes
+  // active accruals, so a credit landed before it would be
+  // archived away). Three guards, in order:
+  // 1. APPLIED FLAG: settings 'catchup_2026_11_15_applied_at'.
+  //    Set inside the same transaction as the credit rows; a
+  //    store that carries it never credits again, across any
+  //    number of restarts and redeploys.
+  // 2. INCIDENT GATE: the credit repairs THIS store's frozen-
+  //    cutoff runs, so it applies only when the books actually
+  //    contain a recorded payout run from the incident window
+  //    (2026-11-08 .. 2026-11-15). A fresh store — a new install,
+  //    a test fixture — has no missed wallets and must never
+  //    mint claimable value out of nowhere. (The flag is NOT set
+  //    when the gate fails; the check simply re-runs next open.)
+  // 3. INSERT OR IGNORE over UNIQUE(day, wallet, kind): even if
+  //    the flag were lost, re-applying inserts nothing — the
+  //    amounts can never double.
+  // The credit is held against the ADDRESS, registered or not:
+  // Collect has no registration gate, so a listed wallet that
+  // was deregistered (or never re-pasted) still receives its
+  // credit the first time it claims.
+  function applyCatchupCredit20261115() {
+    const flag = q(`SELECT value FROM settings WHERE key = 'catchup_2026_11_15_applied_at'`);
+    if (flag) return { applied: false, reason: 'already-applied' };
+    const incidentRun = q(
+      `SELECT day FROM payout_runs WHERE day >= '2026-11-08' AND day <= '2026-11-15'
+        ORDER BY day ASC LIMIT 1`);
+    if (!incidentRun) return { applied: false, reason: 'no-incident-run' };
+    try {
+      db.exec('BEGIN');
+      for (const [wallet, amount] of CATCHUP_CREDIT_2026_11_15) {
+        run(`INSERT OR IGNORE INTO accruals(day, wallet, kind, amount) VALUES(?, ?, ?, ?)`,
+            CATCHUP_CREDIT_DAY, wallet, CATCHUP_CREDIT_KIND, amount);
+      }
+      run(`INSERT INTO settings(key, value) VALUES('catchup_2026_11_15_applied_at', ?)
+           ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+          String(Date.now()));
+      db.exec('COMMIT');
+    } catch (e) {
+      try { db.exec('ROLLBACK'); } catch { /* already rolled back */ }
+      throw e;
+    }
+    return { applied: true };
+  }
+
   runLegacyFrgRewardMigration();
   db.prepare(`INSERT OR IGNORE INTO settings(key, value)
               VALUES('reward_denom', 'uusd'), ('reward_symbol', 'USTC')`).run();
   runUstcToFrgRewardMigration();
+  applyCatchupCredit20261115();
 
   return {
     db,
@@ -603,6 +679,20 @@ export function openStore(path) {
     // by the USTC -> FRG switch.
     legacyUstcAccruals() {
       return all(`SELECT * FROM legacy_ustc_accruals ORDER BY legacy_id`);
+    },
+    // The one-time 2026-11-15 catch-up credit (see
+    // applyCatchupCredit20261115): when it was applied (epoch ms,
+    // or null) and the credit rows as recorded in the accrual
+    // ledger. Read-only audit view — the rows themselves are
+    // ordinary accruals of kind 'catchup-2026-11-15' and flow
+    // through claimable()/Collect like any other accrual.
+    catchupCredit20261115() {
+      const flag = q(`SELECT value FROM settings WHERE key = 'catchup_2026_11_15_applied_at'`);
+      const rows = all(
+        `SELECT wallet, amount FROM accruals WHERE kind = ? ORDER BY wallet`,
+        CATCHUP_CREDIT_KIND)
+        .map((r) => ({ wallet: r.wallet, amount: BigInt(r.amount) }));
+      return { appliedAt: flag ? Number(flag.value) : null, rows };
     },
     // The OPERATIVE live reward symbol, maintained by the
     // migrations ('FRG' after migration #2). server.js resolves the
