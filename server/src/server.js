@@ -53,6 +53,7 @@ import {
   verifyMintTransfer, isValidTxhash,
 } from './nft.js';
 import { cw721TypeCountsMulti } from './nftChain.js';
+import { isBlocked } from './blocklist.js';
 
 // Admin wallet FOR THIS APP ONLY ("New admin" wallet, user-settled
 // 2026-10-24). Other apps keep their own admins — do not change them.
@@ -139,14 +140,17 @@ export async function runSnapshot(store, fetchBalance, day = dayString(), fetchN
 export async function buildPayoutTable(store, fetchBalance, { now = new Date(), priceFeed, poolBalance = null } = {}) {
   const windowEnd = now.getTime();
   const windowStart = 0; // one-time registration: no window — all registered wallets
-  const regs = store.allRegistrations();
+  // BLOCKLIST (owner order, 2026-11-23 — blocklist.js): listed
+  // wallets take no part in any build: no balance read, no
+  // minimum-holding removal, no accrual, no pay. Their
+  // registrations stay on file untouched.
+  const regs = store.allRegistrations().filter((r) => !isBlocked(r.wallet));
   // Timer cutoff: with a deadline set, only registrations at or
   // before it participate. Late registrations are counted and
   // reported, never removed, and skip this build entirely (no
   // balance read, no minimum-holding check).
   const splitDeadlineMs = store.getSplitDeadlineMs();
-  const participants = splitDeadlineMs > 0
-    ? regs.filter((r) => r.registeredAt <= splitDeadlineMs)
+  const participants = splitDeadlineMs > 0    ? regs.filter((r) => r.registeredAt <= splitDeadlineMs)
     : regs;
   const lateRegistrations = splitDeadlineMs > 0
     ? regs.filter((r) => r.registeredAt > splitDeadlineMs)
@@ -318,6 +322,9 @@ export async function runPayoutDay(store, payout, fetchBalance, { now = new Date
   for (const row of table.rows) {
     const claimable = store.claimable(row.wallet);
     row.claimable = claimable;
+    // BLOCKLIST: a row frozen into an already-recorded day before
+    // the list existed still never gets paid (blocklist.js).
+    if (isBlocked(row.wallet)) { row.payStatus = 'blocked'; continue; }
     if (claimable >= MIN_PAYOUT_BASE) payList.push({ wallet: row.wallet, amount: claimable });
     row.payStatus = claimable <= 0n ? 'nothing-owed' : claimable < MIN_PAYOUT_BASE ? 'carried-dust' : 'queued';
   }
@@ -722,6 +729,7 @@ export function createApp({ store, payout, config }) {
   // plain error; nothing is recorded for them.
   app.post('/api/register', (req, res) => {
     const addr = validAddr(req, res); if (!addr) return;
+    if (isBlocked(addr)) return bad(res, 403, 'this wallet is not eligible for this program');
     const referrer = (req.body?.referrer || '').trim() || null;
     if (referrer) {
       if (!isValidTerraAddress(referrer)) return bad(res, 400, 'invalid referrer address');
@@ -765,6 +773,7 @@ export function createApp({ store, payout, config }) {
   // an address — any amount it claims is ignored by design.
   app.post('/api/collect', async (req, res) => {
     const addr = validAddr(req, res); if (!addr) return;
+    if (isBlocked(addr)) return bad(res, 403, 'this wallet is not eligible for this program');
     if (!payout.configured) return bad(res, 503, 'payout wallet not configured yet');
     try {
       const result = await collectMutex(async () => {
@@ -879,6 +888,7 @@ export function createApp({ store, payout, config }) {
   // wallet is configured.
   app.post('/api/nft/collect', async (req, res) => {
     const addr = validAddr(req, res); if (!addr) return;
+    if (isBlocked(addr)) return bad(res, 403, 'this wallet is not eligible for this program');
     if (store.getNftBonusPoolWallet() === '') return bad(res, 503, 'bonus pool wallet not set yet');
     if (!payout.configured) return bad(res, 503, 'payout wallet not configured yet');
     try {
