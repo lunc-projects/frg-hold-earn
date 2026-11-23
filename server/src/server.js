@@ -150,7 +150,8 @@ export async function buildPayoutTable(store, fetchBalance, { now = new Date(), 
   // reported, never removed, and skip this build entirely (no
   // balance read, no minimum-holding check).
   const splitDeadlineMs = store.getSplitDeadlineMs();
-  const participants = splitDeadlineMs > 0    ? regs.filter((r) => r.registeredAt <= splitDeadlineMs)
+  const participants = splitDeadlineMs > 0
+    ? regs.filter((r) => r.registeredAt <= splitDeadlineMs)
     : regs;
   const lateRegistrations = splitDeadlineMs > 0
     ? regs.filter((r) => r.registeredAt > splitDeadlineMs)
