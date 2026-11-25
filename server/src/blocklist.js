@@ -29,6 +29,13 @@
 // Boulay's wallet (terra1exl6tue…dyfqur) — Nicolas excluded
 // "for now" and may be revisited by the owner.
 //
+// REACTIVATED by owner ruling (Tom, 2026-11-24): one LUNC-section
+// wallet - terra1jnr939dqzdf2xdqk2pgd06mceh2rgmruf7w2n8 (97.48 LUNC
+// from 1 listed wallet) - is REMOVED from this list on the owner's
+// direct order, leaving 126 listed wallets. Treat it as EXCLUDED,
+// exactly like the three wallets above, in any future trace
+// rebuild: do not re-add it. See blocklist-association-notes.md.
+//
 // Listed wallets are barred from this program:
 //   - registration is refused (POST /api/register, /api/collect
 //     and /api/nft/collect also refuse), and
@@ -154,7 +161,6 @@ export const BLOCKED_WALLETS = new Set([
   'terra1287ky9jtvhxp2y474nyl3lz47dvsy5x0guu3gw', // 100.00 LUNC from 1 listed wallet
   'terra1luzv7tfa4lxfze9ucvrdtf2tkxgzxl0adxd62y', // 100.00 LUNC from 1 listed wallet
   'terra1at92kzu3q3j77a7nwndkrm6yx75vaswujx635r', // 98.24 LUNC from 1 listed wallet
-  'terra1jnr939dqzdf2xdqk2pgd06mceh2rgmruf7w2n8', // 97.48 LUNC from 1 listed wallet
   'terra190z6d2g8phmnjnwmd6qn672zzv8anfcj730kh0', // 70.00 LUNC from 2 listed wallets
   'terra1exepq8cw3ymna9pcr0wkhgr2etklq86xtf5smf', // 60.00 LUNC from 2 listed wallets
   'terra173q2j4pj2h74vcejq56k286uyy6xz8943zjxmt', // 60.00 LUNC from 2 listed wallets
