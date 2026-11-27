@@ -44,6 +44,17 @@
 // was found. Treat it as EXCLUDED, exactly like the wallets
 // above, in any future trace rebuild: do not re-add it.
 //
+// REACTIVATED by owner ruling (Tom, 2026-11-27): one of the 12
+// seed farmer wallets - terra1a9see2df2w8wh8hsty0y6gw9tkamlkzah8kd74
+// (115,262 FRG farmed in the v1 bug window, 157 payouts) - is
+// REMOVED from this list on the owner's direct order, leaving
+// 124 listed wallets. The wallet's owner (Mk) came forward to
+// the owner directly, said he had flagged the auto-claim-on-
+// restake behavior early, and offered to return FRG. No other
+// wallet is verified as his. Treat it as EXCLUDED, exactly like
+// the wallets above, in any future trace rebuild: do not
+// re-add it.
+//
 // Listed wallets are barred from this program:
 //   - registration is refused (POST /api/register, /api/collect
 //     and /api/nft/collect also refuse), and
@@ -60,7 +71,6 @@ export const BLOCKED_WALLETS = new Set([
   'terra1zdnanxgsyy8zqpmy3dfgges4xlzdskqsrx6nm3',
   'terra10juwukwg2fsvvw8zxx4v09lzvf0zx4wkf3czuq',
   'terra13pl88qlk5vdsxqu9dj6aydnyhncayvdvmvmn9p',
-  'terra1a9see2df2w8wh8hsty0y6gw9tkamlkzah8kd74',
   'terra1mmkq4pv75yc867ug4ax04jwkw36g3eky2t7uey',
   'terra1eev9sy56det940d2hm7376a4awr6kxgdttr5fa',
   'terra1n5qj93jw56wsym0yp2kpll2ydlpa5c8a0dvej6',
