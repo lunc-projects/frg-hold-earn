@@ -36,6 +36,14 @@
 // exactly like the three wallets above, in any future trace
 // rebuild: do not re-add it. See blocklist-association-notes.md.
 //
+// REACTIVATED by owner ruling (Tom, 2026-11-26): one LUNC-section
+// wallet - terra1pwmnn2jwa9re928ugyck0x354y9vuea94gmml6 (11,015
+// LUNC received from 2 listed wallets) - is REMOVED from this
+// list on the owner's direct order, leaving 125 listed wallets.
+// The member only ever received LUNC; no FRG farming connection
+// was found. Treat it as EXCLUDED, exactly like the wallets
+// above, in any future trace rebuild: do not re-add it.
+//
 // Listed wallets are barred from this program:
 //   - registration is refused (POST /api/register, /api/collect
 //     and /api/nft/collect also refuse), and
@@ -132,7 +140,6 @@ export const BLOCKED_WALLETS = new Set([
   'terra1mx7t8a82tpt869e5l7sa0aaua7utf4r3h0fhey', // 20,000.00 LUNC from 1 listed wallet
   'terra1amxdfw6e58e929rdswmfj73hdls984lnta8f7g', // 20,000.00 LUNC from 2 listed wallets
   'terra18m8lgy35nqypx7jnv5n8x9lwh5necyym5upndl', // 20,000.00 LUNC from 1 listed wallet
-  'terra1pwmnn2jwa9re928ugyck0x354y9vuea94gmml6', // 11,015.00 LUNC from 2 listed wallets
   'terra12lm5x86eesqajuw2vc86rtc8pa8rhca5qayclt', // 10,040.00 LUNC from 1 listed wallet
   'terra196xse3afn29g50fgevfucxfj7hxxe77v686ksp', // 9,900.00 LUNC from 1 listed wallet
   'terra1sfa3jy4pkddugv9uvu9thg7w6f2fj5pqxjfxse', // 5,862.00 LUNC from 1 listed wallet
